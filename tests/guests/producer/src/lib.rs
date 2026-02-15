@@ -15,3 +15,9 @@ impl bindings::Guest for Producer {
         a + b
     }
 }
+
+impl bindings::exports::composer::test::iproducer::Guest for Producer {
+    async fn ping(ping: i32) -> i32 {
+        ping
+    }
+}

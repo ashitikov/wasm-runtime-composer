@@ -22,6 +22,7 @@ fn main() {
             .arg("--manifest-path")
             .arg(&manifest)
             .env("CARGO_TARGET_DIR", &target_dir)
+            .env_remove("RUSTUP_TOOLCHAIN")
             .status()
             .unwrap_or_else(|e| panic!("Failed to run cargo build for {}: {}", guest, e));
 

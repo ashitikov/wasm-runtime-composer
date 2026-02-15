@@ -1,10 +1,24 @@
 package composer:test;
 
+interface iproducer {
+    ping: async func(ping: s32) -> s32;
+}
+
 world producer {
     export add: func(a: s32, b: s32) -> s32;
+    export iproducer;
+}
+
+interface iconsumer {
+    run-add: func() -> s32;
+    run-ping: async func() -> s32;
 }
 
 world consumer {
     import add: func(a: s32, b: s32) -> s32;
-    export run: func() -> s32;
+    import iproducer;
+
+    export run-add: func() -> s32;
+    export run-ping: async func() -> s32;
+    export iconsumer;
 }

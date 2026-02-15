@@ -35,6 +35,13 @@ fn guests_dir() -> String {
     )
 }
 
+fn test_engine() -> Engine {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    Engine::new(&config).unwrap()
+}
+
 /// Helper: instantiate producer and consumer, wire them up, return composition.
 async fn make_composition(engine: &Engine) -> wasm_runtime_composer::Composition {
     let dir = guests_dir();
@@ -54,12 +61,15 @@ async fn make_composition(engine: &Engine) -> wasm_runtime_composer::Composition
         .unwrap();
     let mut composable_producer = ComposableInstance::new(producer_instance, store_producer);
 
-    // 2. Create consumer linker, link producer's "add" export, then instantiate
+    // 2. Create consumer linker, link producer exports, then instantiate
     let mut linker_consumer: Linker<TestState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker_consumer).unwrap();
     {
         let mut root = linker_consumer.root();
         composable_producer.link_export("add", &mut root).unwrap();
+        composable_producer
+            .link_export("composer:test/iproducer", &mut root)
+            .unwrap();
     }
     let mut store_consumer = Store::new(engine, TestState::new());
     let consumer_instance = linker_consumer
@@ -78,38 +88,78 @@ async fn make_composition(engine: &Engine) -> wasm_runtime_composer::Composition
     builder.build().unwrap()
 }
 
-/// Cross-component call via async engine (no concurrency).
-///
-/// Flow: composition.call("run") -> consumer.run() -> add(20, 22) -> producer.add -> 42
+/// Sync cross-component call: consumer.run_add() -> producer.add(20, 22) -> 42
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cross_component_call_async() {
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    let engine = Engine::new(&config).unwrap();
-
+async fn test_cross_component_call_sync() {
+    let engine = test_engine();
     let composition = make_composition(&engine).await;
 
-    let run = composition.get_func(None, "run").unwrap();
+    let run_add = composition.get_func(None, "run-add").unwrap();
     let mut results = vec![Val::S32(0)];
-    run.call(&[], &mut results).await.unwrap();
+    run_add.call(&[], &mut results).await.unwrap();
     assert_eq!(results[0], Val::S32(42));
 }
 
-/// Cross-component call via async engine with concurrency support.
-///
-/// Flow: composition.call("run") -> consumer.run() -> add(20, 22) -> producer.add -> 42
-#[cfg(feature = "component-model-async")]
+/// Async cross-component call: consumer.run_ping() -> producer.ping(42) -> 42
+/// Exercises the concurrent call path (async func in WIT).
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cross_component_call_concurrent() {
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
-    let engine = Engine::new(&config).unwrap();
-
+async fn test_cross_component_call_async() {
+    let engine = test_engine();
     let composition = make_composition(&engine).await;
 
-    let run = composition.get_func(None, "run").unwrap();
+    let run_ping = composition.get_func(None, "run-ping").unwrap();
     let mut results = vec![Val::S32(0)];
-    run.call(&[], &mut results).await.unwrap();
+    run_ping.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
+/// Call a function from an exported interface: composer:test/iconsumer.run-add
+#[tokio::test(flavor = "multi_thread")]
+async fn test_interface_export_sync() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_add = composition
+        .get_func(Some("composer:test/iconsumer"), "run-add")
+        .unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_add.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
+/// Call an async function from an exported interface: composer:test/iconsumer.run-ping
+#[tokio::test(flavor = "multi_thread")]
+async fn test_interface_export_async() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_ping = composition
+        .get_func(Some("composer:test/iconsumer"), "run-ping")
+        .unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_ping.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
+/// Both sync and async cross-component calls on a single-threaded tokio runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn test_single_thread_sync() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_add = composition.get_func(None, "run-add").unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_add.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_single_thread_async() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_ping = composition.get_func(None, "run-ping").unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_ping.call(&[], &mut results).await.unwrap();
     assert_eq!(results[0], Val::S32(42));
 }
