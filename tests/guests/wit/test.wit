@@ -1,0 +1,10 @@
+package composer:test;
+
+world producer {
+    export add: func(a: s32, b: s32) -> s32;
+}
+
+world consumer {
+    import add: func(a: s32, b: s32) -> s32;
+    export run: func() -> s32;
+}

@@ -1,0 +1,24 @@
+[package]
+name = "wasm-runtime-composer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+default = ["component-model-async"]
+component-model-async = ["wasmtime/component-model-async"]
+
+[dependencies]
+wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", features = ["async"] }
+wasmtime-environ = { git = "https://github.com/bytecodealliance/wasmtime" }
+thiserror = "2.0"
+anyhow = "1.0"
+priority-queue = "2.7"
+tokio = { version = "1", features = ["sync", "rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wasmtime = { git = "https://github.com/bytecodealliance/wasmtime" }
+wasmtime-wasi = { git = "https://github.com/bytecodealliance/wasmtime" }
