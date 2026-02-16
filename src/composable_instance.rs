@@ -1,13 +1,114 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use wasmtime::Store;
 use wasmtime::component::types::{ComponentFunc, ComponentInstance, ComponentItem};
-use wasmtime::component::{Component, ComponentExportIndex, Instance, ResourceType, Val};
+use wasmtime::component::{
+    Component, ComponentExportIndex, Instance, ResourceAny, ResourceDynamic, ResourceType, Val,
+};
 
 use crate::composable::{ComposableType, ExportFunc, InterfaceSet, ResolvedImport};
 use crate::linker_ops::LinkerOps;
 use crate::{Composable, CompositionError};
+
+// ---------------------------------------------------------------------------
+// Resource proxy table
+// ---------------------------------------------------------------------------
+
+/// Global counter for unique `ResourceType::host_dynamic` payloads.
+static NEXT_RESOURCE_TY_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Maps proxy IDs (u32) to producer-side `ResourceAny` handles.
+///
+/// Shared (via `Arc`) between linker callbacks (remap params/results)
+/// and the resource destructor (cleanup on drop).
+pub struct ResourceProxyTable {
+    entries: Mutex<Vec<Option<ResourceAny>>>,
+    /// Unique payload for `ResourceType::host_dynamic()`.
+    ty_id: u32,
+}
+
+impl ResourceProxyTable {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            ty_id: NEXT_RESOURCE_TY_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Store a producer-side `ResourceAny` and return its proxy ID.
+    fn insert(&self, producer_ra: ResourceAny) -> u32 {
+        let mut entries = self.entries.lock().unwrap();
+        // Reuse a vacant slot if available.
+        for (i, slot) in entries.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(producer_ra);
+                return i as u32;
+            }
+        }
+        let id = entries.len() as u32;
+        entries.push(Some(producer_ra));
+        id
+    }
+
+    /// Look up the producer-side `ResourceAny` for a proxy ID.
+    fn get(&self, proxy_id: u32) -> Option<ResourceAny> {
+        let entries = self.entries.lock().unwrap();
+        entries.get(proxy_id as usize).copied().flatten()
+    }
+
+    /// Remove and return the producer-side `ResourceAny` for a proxy ID.
+    pub(crate) fn remove(&self, proxy_id: u32) -> Option<ResourceAny> {
+        let mut entries = self.entries.lock().unwrap();
+        entries.get_mut(proxy_id as usize).and_then(|slot| slot.take())
+    }
+
+    /// Replace producer-side `ResourceAny` values in results with consumer
+    /// proxy handles created via `ResourceDynamic`.
+    pub(crate) fn remap_results<T>(
+        &self,
+        store: &mut wasmtime::StoreContextMut<'_, T>,
+        results: &mut [Val],
+    ) -> wasmtime::Result<()> {
+        for val in results.iter_mut() {
+            if let Val::Resource(producer_ra) = val {
+                let proxy_id = self.insert(*producer_ra);
+                let rd = ResourceDynamic::new_own(proxy_id, self.ty_id);
+                *val = Val::Resource(rd.try_into_resource_any(&mut *store)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace consumer proxy handles in params with the original
+    /// producer-side `ResourceAny` values.
+    ///
+    /// Returns `None` if no resources are present (no allocation needed).
+    pub(crate) fn remap_params<T>(
+        &self,
+        store: &mut wasmtime::StoreContextMut<'_, T>,
+        params: &[Val],
+    ) -> Option<Vec<Val>> {
+        if !params.iter().any(|v| matches!(v, Val::Resource(_))) {
+            return None;
+        }
+        let mut remapped = params.to_vec();
+        for val in remapped.iter_mut() {
+            if let Val::Resource(consumer_ra) = val {
+                if let Ok(rd) =
+                    ResourceDynamic::try_from_resource_any(*consumer_ra, &mut *store)
+                {
+                    if let Some(producer_ra) = self.get(rd.rep()) {
+                        *val = Val::Resource(producer_ra);
+                    }
+                }
+            }
+        }
+        Some(remapped)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Channel task types
@@ -271,50 +372,6 @@ pub struct ComposableInstance {
     ty: ComposableType,
     export_types: HashMap<String, ComponentItem>,
     component: Component,
-    /// Instantiated resource types keyed by export index.
-    /// Captured in `new()` before the store moves to the inbox loop.
-    resource_types: HashMap<ComponentExportIndex, ResourceType>,
-}
-
-/// Walk the export tree and collect instantiated `ResourceType`s.
-fn collect_resource_types<T>(
-    component: &Component,
-    instance: &Instance,
-    store: &mut Store<T>,
-    items: &HashMap<String, ComponentItem>,
-    engine: &wasmtime::Engine,
-    parent: Option<&ComponentExportIndex>,
-    out: &mut HashMap<ComponentExportIndex, ResourceType>,
-) {
-    for (name, item) in items {
-        match item {
-            ComponentItem::Resource(_) => {
-                if let Some(export_index) = component.get_export_index(parent, name) {
-                    if let Some(rt) = instance.get_resource(&mut *store, &export_index) {
-                        out.insert(export_index, rt);
-                    }
-                }
-            }
-            ComponentItem::ComponentInstance(inst_ty) => {
-                if let Some(inst_index) = component.get_export_index(parent, name) {
-                    let children: HashMap<String, ComponentItem> = inst_ty
-                        .exports(engine)
-                        .map(|(n, ty)| (n.to_string(), ty))
-                        .collect();
-                    collect_resource_types(
-                        component,
-                        instance,
-                        store,
-                        &children,
-                        engine,
-                        Some(&inst_index),
-                        out,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 impl ComposableInstance {
@@ -326,7 +383,7 @@ impl ComposableInstance {
     /// # Panics
     ///
     /// Panics if called outside a tokio runtime context.
-    pub fn new<T: Send + 'static>(instance: Instance, mut store: Store<T>) -> Self {
+    pub fn new<T: Send + 'static>(instance: Instance, store: Store<T>) -> Self {
         let instance_pre = instance.instance_pre(&store);
         let component = instance_pre.component().clone();
         let component_type = component.component_type();
@@ -347,21 +404,6 @@ impl ComposableInstance {
             .map(|(name, ty)| (name.to_string(), ty))
             .collect();
 
-        let mut resource_types = HashMap::new();
-        collect_resource_types(
-            &component,
-            &instance,
-            &mut store,
-            &export_types,
-            engine,
-            None,
-            &mut resource_types,
-        );
-
-        eprintln!("---begin");
-        eprintln!("resources: {:?}", resource_types);
-        eprintln!("---end");
-
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(inbox_loop(store, instance, rx));
 
@@ -370,7 +412,6 @@ impl ComposableInstance {
             ty: ComposableType::new(exports, imports),
             export_types,
             component,
-            resource_types,
         }
     }
 }
@@ -444,7 +485,7 @@ impl Composable for ComposableInstance {
         let export_type = self.export_types.get(name).cloned().ok_or_else(|| {
             CompositionError::LinkingError(format!("Export '{}' not found", name))
         })?;
-        self.link_export_item(name, &export_type, None, linker)
+        self.link_export_item(name, &export_type, None, linker, None)
     }
 }
 
@@ -474,10 +515,11 @@ impl ComposableInstance {
         item: &ComponentItem,
         parent: Option<&ComponentExportIndex>,
         linker: &mut dyn LinkerOps,
+        proxy: Option<&Arc<ResourceProxyTable>>,
     ) -> Result<(), CompositionError> {
         match item {
             ComponentItem::ComponentFunc(func_ty) => {
-                self.link_export_function(name, func_ty, parent, linker)
+                self.link_export_function(name, func_ty, parent, linker, proxy)
             }
             ComponentItem::ComponentInstance(instance_ty) => {
                 self.link_export_instance(name, instance_ty, parent, linker)
@@ -486,7 +528,7 @@ impl ComposableInstance {
                 self.link_export_component(name, component_ty, parent, linker)
             }
             ComponentItem::Resource(resource_ty) => {
-                self.link_export_resource(name, resource_ty, parent, linker)
+                self.link_export_resource(name, resource_ty, parent, linker, proxy)
             }
             ComponentItem::Type(_) => Ok(()),
             ComponentItem::CoreFunc(_) => Err(CompositionError::LinkingError(
@@ -504,6 +546,7 @@ impl ComposableInstance {
         func_ty: &ComponentFunc,
         parent: Option<&ComponentExportIndex>,
         linker: &mut dyn LinkerOps,
+        proxy: Option<&Arc<ResourceProxyTable>>,
     ) -> Result<(), CompositionError> {
         let export_index = self
             .component
@@ -517,6 +560,7 @@ impl ComposableInstance {
 
         let tx = self.tx.downgrade();
         let func_type = func_ty.clone();
+        let proxy = proxy.cloned();
 
         #[cfg(feature = "component-model-async")]
         if func_ty.async_() {
@@ -535,6 +579,7 @@ impl ComposableInstance {
                             .map_err(into_wasmtime_error)
                     })
                 }),
+                proxy,
             );
         }
 
@@ -553,6 +598,7 @@ impl ComposableInstance {
                         .map_err(into_wasmtime_error)
                 })
             }),
+            proxy,
         )
     }
 
@@ -566,7 +612,7 @@ impl ComposableInstance {
         let engine = self.component.engine().clone();
         let items: Vec<_> = component_ty.imports(&engine).collect();
         for (name, item) in items {
-            self.link_export_item(name, &item, parent, linker)?;
+            self.link_export_item(name, &item, parent, linker, None)?;
         }
 
         Ok(())
@@ -576,22 +622,18 @@ impl ComposableInstance {
         &self,
         name: &str,
         _resource_ty: &ResourceType,
-        parent: Option<&ComponentExportIndex>,
+        _parent: Option<&ComponentExportIndex>,
         linker: &mut dyn LinkerOps,
+        proxy: Option<&Arc<ResourceProxyTable>>,
     ) -> Result<(), CompositionError> {
-        let export_index = self
-            .component
-            .get_export_index(parent, name)
-            .ok_or_else(|| {
-                CompositionError::LinkingError(format!("Resource '{}' export index not found", name))
-            })?;
-        let instantiated_ty = self.resource_types.get(&export_index).ok_or_else(|| {
+        let proxy = proxy.ok_or_else(|| {
             CompositionError::LinkingError(format!(
-                "Instantiated resource type for '{}' not found",
+                "Resource '{}' has no proxy table (should be created by parent instance)",
                 name
             ))
         })?;
-        linker.resource(name, *instantiated_ty)
+        let ty = ResourceType::host_dynamic(proxy.ty_id);
+        linker.resource(name, ty, Some(proxy.clone()))
     }
 
     fn link_export_instance(
@@ -617,6 +659,16 @@ impl ComposableInstance {
             .map(|(n, ty)| (n.to_string(), ty))
             .collect();
 
+        // Create a proxy table if the interface contains any resources.
+        let has_resources = exports
+            .iter()
+            .any(|(_, ty)| matches!(ty, ComponentItem::Resource(_)));
+        let proxy = if has_resources {
+            Some(Arc::new(ResourceProxyTable::new()))
+        } else {
+            None
+        };
+
         let this = self;
         linker.with_instance(
             name,
@@ -627,6 +679,7 @@ impl ComposableInstance {
                         export_ty,
                         Some(&instance_export_index),
                         sub_linker,
+                        proxy.as_ref(),
                     )?;
                 }
                 Ok(())
