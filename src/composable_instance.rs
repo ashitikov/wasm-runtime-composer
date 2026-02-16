@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use wasmtime::Store;
 use wasmtime::component::types::{ComponentFunc, ComponentInstance, ComponentItem};
-use wasmtime::component::{Component, ComponentExportIndex, Instance, Val};
+use wasmtime::component::{Component, ComponentExportIndex, Instance, ResourceType, Val};
 
 use crate::composable::{ComposableType, ExportFunc, InterfaceSet, ResolvedImport};
 use crate::linker_ops::LinkerOps;
@@ -128,18 +128,55 @@ async fn inbox_loop<T: Send + 'static>(
     }
 }
 
+/// Shared reply slots for concurrent dispatch.
+///
+/// Allows the closure inside `run_concurrent` to send replies immediately
+/// as each task completes, while the outer scope retains access to unsent
+/// replies for error recovery after future cancellation.
+///
+/// Contention is zero: `poll_until` polls futures sequentially on one thread.
+#[cfg(feature = "component-model-async")]
+#[derive(Clone)]
+struct ReplySlots(std::sync::Arc<tokio::sync::Mutex<Vec<Option<ReplyTx>>>>);
+
+#[cfg(feature = "component-model-async")]
+impl ReplySlots {
+    fn new(replies: Vec<Option<ReplyTx>>) -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Mutex::new(replies)))
+    }
+
+    /// Take the reply channel at `idx` and send the result through it.
+    async fn send(&self, idx: usize, result: Result<(), CompositionError>) {
+        if let Some(reply) = self.0.lock().await[idx].take() {
+            let _ = reply.send(result);
+        }
+    }
+
+    /// Propagate an error to all replies that haven't been sent yet.
+    ///
+    /// The first unsent slot receives the original error; the rest get `Unavailable`.
+    async fn propagate_error(&self, error: wasmtime::Error) {
+        let mut error = Some(CompositionError::Runtime(error));
+        for slot in self.0.lock().await.iter_mut() {
+            if let Some(reply) = slot.take() {
+                let e = error.take().unwrap_or(CompositionError::Unavailable);
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
+}
+
 /// Dispatch tasks concurrently via `run_concurrent` + `call_concurrent`.
 ///
-/// Drains `tasks` and sends replies. If `run_concurrent` fails (e.g.
-/// `concurrency_support` disabled in engine config), reply channels are dropped
-/// and callers receive `Unavailable`.
+/// Drains `tasks` and sends replies individually as each completes.
+/// If `run_concurrent` fails (e.g. a subtask traps), the closure is cancelled
+/// via future-drop; any replies not yet sent receive the error.
 #[cfg(feature = "component-model-async")]
 async fn dispatch_concurrent<T: Send + 'static>(
     store: &mut Store<T>,
     instance: &Instance,
     tasks: &mut Vec<ChannelTask>,
 ) {
-    // Resolve Func handles while we still have &mut store.
     let funcs: Vec<_> = tasks
         .iter()
         .map(|task| instance.get_func(&mut *store, &task.export_index))
@@ -147,36 +184,50 @@ async fn dispatch_concurrent<T: Send + 'static>(
 
     // Destructure tasks synchronously so raw pointers never enter
     // the async generator state (raw pointers are !Send).
+    let mut replies = Vec::new();
     let prepared: Vec<_> = tasks
         .drain(..)
         .zip(funcs)
-        .map(|(task, func)| {
-            // SAFETY: caller awaits reply before dropping data.
+        .enumerate()
+        .map(|(idx, (task, func))| {
             let params = unsafe { &*task.data.params };
             let results = unsafe { &mut *task.data.results };
-            (func, params, results, task.reply)
+            replies.push(Some(task.reply));
+            (func, params, results, idx)
         })
         .collect();
 
-    let _ = store
+    let slots = ReplySlots::new(replies);
+
+    if let Err(e) = store
         .run_concurrent(async |accessor| {
             let futs: Vec<_> = prepared
                 .into_iter()
-                .map(|(func, params, results, reply)| async move {
-                    let result = match func {
-                        Some(f) => f
-                            .call_concurrent(&accessor, params, results)
-                            .await
-                            .map(|_exit| ())
-                            .map_err(CompositionError::from),
-                        None => Err(CompositionError::FuncNotFound),
-                    };
-                    let _ = reply.send(result);
+                .map(|(func, params, results, idx)| {
+                    let slots = slots.clone();
+                    async move {
+                        let result = match func {
+                            Some(f) => async {
+                                let exit = f
+                                    .call_concurrent(&accessor, params, results)
+                                    .await
+                                    .map_err(CompositionError::from)?;
+                                exit.block(&accessor).await;
+                                Ok(())
+                            }
+                            .await,
+                            None => Err(CompositionError::FuncNotFound),
+                        };
+                        slots.send(idx, result).await;
+                    }
                 })
                 .collect();
             futures::future::join_all(futs).await;
         })
-        .await;
+        .await
+    {
+        slots.propagate_error(e).await;
+    }
 }
 
 /// Dispatch tasks sequentially via `call_async` + `post_return_async`.
@@ -220,6 +271,50 @@ pub struct ComposableInstance {
     ty: ComposableType,
     export_types: HashMap<String, ComponentItem>,
     component: Component,
+    /// Instantiated resource types keyed by export index.
+    /// Captured in `new()` before the store moves to the inbox loop.
+    resource_types: HashMap<ComponentExportIndex, ResourceType>,
+}
+
+/// Walk the export tree and collect instantiated `ResourceType`s.
+fn collect_resource_types<T>(
+    component: &Component,
+    instance: &Instance,
+    store: &mut Store<T>,
+    items: &HashMap<String, ComponentItem>,
+    engine: &wasmtime::Engine,
+    parent: Option<&ComponentExportIndex>,
+    out: &mut HashMap<ComponentExportIndex, ResourceType>,
+) {
+    for (name, item) in items {
+        match item {
+            ComponentItem::Resource(_) => {
+                if let Some(export_index) = component.get_export_index(parent, name) {
+                    if let Some(rt) = instance.get_resource(&mut *store, &export_index) {
+                        out.insert(export_index, rt);
+                    }
+                }
+            }
+            ComponentItem::ComponentInstance(inst_ty) => {
+                if let Some(inst_index) = component.get_export_index(parent, name) {
+                    let children: HashMap<String, ComponentItem> = inst_ty
+                        .exports(engine)
+                        .map(|(n, ty)| (n.to_string(), ty))
+                        .collect();
+                    collect_resource_types(
+                        component,
+                        instance,
+                        store,
+                        &children,
+                        engine,
+                        Some(&inst_index),
+                        out,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl ComposableInstance {
@@ -231,7 +326,7 @@ impl ComposableInstance {
     /// # Panics
     ///
     /// Panics if called outside a tokio runtime context.
-    pub fn new<T: Send + 'static>(instance: Instance, store: Store<T>) -> Self {
+    pub fn new<T: Send + 'static>(instance: Instance, mut store: Store<T>) -> Self {
         let instance_pre = instance.instance_pre(&store);
         let component = instance_pre.component().clone();
         let component_type = component.component_type();
@@ -252,6 +347,21 @@ impl ComposableInstance {
             .map(|(name, ty)| (name.to_string(), ty))
             .collect();
 
+        let mut resource_types = HashMap::new();
+        collect_resource_types(
+            &component,
+            &instance,
+            &mut store,
+            &export_types,
+            engine,
+            None,
+            &mut resource_types,
+        );
+
+        eprintln!("---begin");
+        eprintln!("resources: {:?}", resource_types);
+        eprintln!("---end");
+
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(inbox_loop(store, instance, rx));
 
@@ -260,6 +370,7 @@ impl ComposableInstance {
             ty: ComposableType::new(exports, imports),
             export_types,
             component,
+            resource_types,
         }
     }
 }
@@ -371,18 +482,18 @@ impl ComposableInstance {
             ComponentItem::ComponentInstance(instance_ty) => {
                 self.link_export_instance(name, instance_ty, parent, linker)
             }
+            ComponentItem::Component(component_ty) => {
+                self.link_export_component(name, component_ty, parent, linker)
+            }
+            ComponentItem::Resource(resource_ty) => {
+                self.link_export_resource(name, resource_ty, parent, linker)
+            }
             ComponentItem::Type(_) => Ok(()),
             ComponentItem::CoreFunc(_) => Err(CompositionError::LinkingError(
                 "CoreFunc exports not supported".to_string(),
             )),
             ComponentItem::Module(_) => Err(CompositionError::LinkingError(
                 "Module exports not supported".to_string(),
-            )),
-            ComponentItem::Component(_) => Err(CompositionError::LinkingError(
-                "Component exports not supported".to_string(),
-            )),
-            ComponentItem::Resource(_) => Err(CompositionError::LinkingError(
-                "Resource exports not yet supported".to_string(),
             )),
         }
     }
@@ -443,6 +554,44 @@ impl ComposableInstance {
                 })
             }),
         )
+    }
+
+    fn link_export_component(
+        &self,
+        name: &str, // TODO: check if needed and add tests ?
+        component_ty: &wasmtime::component::types::Component,
+        parent: Option<&ComponentExportIndex>,
+        linker: &mut dyn LinkerOps,
+    ) -> Result<(), CompositionError> {
+        let engine = self.component.engine().clone();
+        let items: Vec<_> = component_ty.imports(&engine).collect();
+        for (name, item) in items {
+            self.link_export_item(name, &item, parent, linker)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_export_resource(
+        &self,
+        name: &str,
+        _resource_ty: &ResourceType,
+        parent: Option<&ComponentExportIndex>,
+        linker: &mut dyn LinkerOps,
+    ) -> Result<(), CompositionError> {
+        let export_index = self
+            .component
+            .get_export_index(parent, name)
+            .ok_or_else(|| {
+                CompositionError::LinkingError(format!("Resource '{}' export index not found", name))
+            })?;
+        let instantiated_ty = self.resource_types.get(&export_index).ok_or_else(|| {
+            CompositionError::LinkingError(format!(
+                "Instantiated resource type for '{}' not found",
+                name
+            ))
+        })?;
+        linker.resource(name, *instantiated_ty)
     }
 
     fn link_export_instance(

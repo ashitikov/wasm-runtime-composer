@@ -1,7 +1,13 @@
 package composer:test;
 
 interface iproducer {
+    resource pong {
+        get: async func() -> s32;
+    }
+
     ping: async func(ping: s32) -> s32;
+    get-pong: func(ping: s32) -> pong;
+    get-pong-res: async func(pong: pong) -> s32;
 }
 
 world producer {
@@ -12,6 +18,8 @@ world producer {
 interface iconsumer {
     run-add: func() -> s32;
     run-ping: async func() -> s32;
+    run-pong: async func() -> s32;
+    run-pong-res: async func() -> s32;
 }
 
 world consumer {
@@ -20,5 +28,7 @@ world consumer {
 
     export run-add: func() -> s32;
     export run-ping: async func() -> s32;
+    export run-pong: async func() -> s32;
+    export run-pong-res: async func() -> s32;
     export iconsumer;
 }

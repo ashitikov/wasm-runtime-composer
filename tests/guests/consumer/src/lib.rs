@@ -18,6 +18,16 @@ impl bindings::Guest for Consumer {
     async fn run_ping() -> i32 {
         bindings::composer::test::iproducer::ping(42).await
     }
+
+    async fn run_pong() -> i32 {
+        let pong = bindings::composer::test::iproducer::get_pong(42);
+        pong.get().await
+    }
+
+    async fn run_pong_res() -> i32 {
+        let pong = bindings::composer::test::iproducer::get_pong(42);
+        bindings::composer::test::iproducer::get_pong_res(pong).await
+    }
 }
 
 impl bindings::exports::composer::test::iconsumer::Guest for Consumer {
@@ -27,5 +37,15 @@ impl bindings::exports::composer::test::iconsumer::Guest for Consumer {
 
     async fn run_ping() -> i32 {
         bindings::composer::test::iproducer::ping(42).await
+    }
+
+    async fn run_pong() -> i32 {
+        let pong = bindings::composer::test::iproducer::get_pong(42);
+        pong.get().await
+    }
+
+    async fn run_pong_res() -> i32 {
+        let pong = bindings::composer::test::iproducer::get_pong(42);
+        bindings::composer::test::iproducer::get_pong_res(pong).await
     }
 }

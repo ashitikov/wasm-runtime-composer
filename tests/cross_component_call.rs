@@ -153,6 +153,30 @@ async fn test_single_thread_sync() {
     assert_eq!(results[0], Val::S32(42));
 }
 
+/// Resource round-trip via method: consumer.run_pong() -> producer.get_pong(42) -> pong.get() -> 42
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cross_component_resource() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_pong = composition.get_func(None, "run-pong").unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_pong.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
+/// Resource round-trip via function: consumer.run_pong_res() -> producer.get_pong(42) -> producer.get_pong_res(pong) -> 42
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cross_component_resource_func() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_pong_res = composition.get_func(None, "run-pong-res").unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_pong_res.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_single_thread_async() {
     let engine = test_engine();

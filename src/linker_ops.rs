@@ -1,4 +1,4 @@
-use wasmtime::component::types;
+use wasmtime::component::types::{self, ResourceType};
 use wasmtime::component::{LinkerInstance, Val};
 
 use crate::CompositionError;
@@ -17,6 +17,9 @@ pub trait LinkerOps {
     /// can run concurrently (uses `Accessor<T>` instead of exclusive `StoreContextMut`).
     #[cfg(feature = "component-model-async")]
     fn func_new_concurrent(&mut self, name: &str, func: BoxedConcurrentFunc) -> Result<(), CompositionError>;
+
+    /// Register a resource type with a no-op destructor.
+    fn resource(&mut self, name: &str, ty: ResourceType) -> Result<(), CompositionError>;
 
     /// Execute a callback with a sub-linker for a nested instance.
     fn with_instance<'a>(
@@ -75,6 +78,13 @@ impl<'a, T: Send + 'static> LinkerOps for LinkerInstance<'a, T> {
                 Box::pin(func(params, results))
             },
         )?;
+        Ok(())
+    }
+
+    fn resource(&mut self, name: &str, ty: ResourceType) -> Result<(), CompositionError> {
+        LinkerInstance::resource_async(self, name, ty, |_store, _rep| {
+            Box::new(async { Ok(()) })
+        })?;
         Ok(())
     }
 
