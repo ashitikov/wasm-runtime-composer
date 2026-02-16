@@ -38,8 +38,8 @@ pub enum CompositionError {
     #[error("linking error: {0}")]
     LinkingError(String),
 
-    #[error("store actor stopped")]
-    ActorStopped,
+    #[error("composable unavailable")]
+    Unavailable,
 
     #[error(transparent)]
     Runtime(#[from] wasmtime::Error),

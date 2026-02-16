@@ -27,8 +27,7 @@ pub trait LinkerOps {
 }
 
 /// Type-erased function for async calls.
-/// Matches wasmtime's `func_new_async` callback: receives params and
-/// a pre-allocated results slice, writes results in-place.
+/// Receives params and a pre-allocated results slice, writes results in-place.
 pub type BoxedAsyncFunc = Box<
     dyn for<'a> Fn(
             &'a [Val],

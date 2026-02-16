@@ -10,7 +10,7 @@ use crate::linker_ops::LinkerOps;
 use crate::{Composable, CompositionError};
 
 // ---------------------------------------------------------------------------
-// Call task types
+// Channel task types
 // ---------------------------------------------------------------------------
 
 /// Raw pointers to caller-owned params and results buffers.
@@ -27,73 +27,117 @@ struct RawCallData {
 }
 
 // SAFETY: The pointed-to data lives on the caller's stack and remains
-// valid until the reply is received. Only the actor dereferences these
+// valid until the reply is received. Only the inbox loop dereferences these
 // pointers, and it does so before sending the reply.
 unsafe impl Send for RawCallData {}
 
 /// Reply channel — always async (oneshot).
-type CallReply = tokio::sync::oneshot::Sender<Result<(), CompositionError>>;
+type ReplyTx = tokio::sync::oneshot::Sender<Result<(), CompositionError>>;
 
-/// A single function-call request sent to the store actor.
-struct CallTask {
+/// A single function-call request sent through the channel.
+struct ChannelTask {
     export_index: ComponentExportIndex,
     func_type: ComponentFunc,
     data: RawCallData,
-    reply: CallReply,
+    reply: ReplyTx,
 }
 
 // ---------------------------------------------------------------------------
-// Store actor
+// Error conversions (channel internals → CompositionError / wasmtime::Error)
 // ---------------------------------------------------------------------------
 
-async fn run_actor<T: Send + 'static>(
+impl From<mpsc::error::SendError<ChannelTask>> for CompositionError {
+    fn from(_: mpsc::error::SendError<ChannelTask>) -> Self {
+        Self::Unavailable
+    }
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for CompositionError {
+    fn from(_: tokio::sync::oneshot::error::RecvError) -> Self {
+        Self::Unavailable
+    }
+}
+
+fn into_wasmtime_error(e: CompositionError) -> wasmtime::Error {
+    match e {
+        CompositionError::Runtime(e) => e,
+        e => e.into(),
+    }
+}
+
+/// Send a call through the channel and await the reply.
+async fn send_call(
+    tx: mpsc::WeakUnboundedSender<ChannelTask>,
+    export_index: ComponentExportIndex,
+    func_type: ComponentFunc,
+    data: RawCallData,
+) -> Result<(), CompositionError> {
+    let tx = tx.upgrade().ok_or(CompositionError::Unavailable)?;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(ChannelTask {
+        export_index,
+        func_type,
+        data,
+        reply: reply_tx,
+    })?;
+    reply_rx.await?
+}
+
+// ---------------------------------------------------------------------------
+// Inbox loop
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "component-model-async")]
+async fn inbox_loop<T: Send + 'static>(
     mut store: Store<T>,
     instance: Instance,
-    mut rx: mpsc::UnboundedReceiver<CallTask>,
+    mut rx: mpsc::UnboundedReceiver<ChannelTask>,
 ) {
     let mut batch = Vec::new();
+    let mut async_run = Vec::new();
     while rx.recv_many(&mut batch, usize::MAX).await > 0 {
-        #[cfg(feature = "component-model-async")]
-        {
-            // Process tasks in order, batching consecutive async tasks into
-            // run_concurrent while executing sync tasks between them.
-            let mut async_run = Vec::new();
-            for task in batch.drain(..) {
-                if task.func_type.async_() {
-                    async_run.push(task);
-                } else {
-                    // Flush accumulated async run before the sync task.
-                    if !async_run.is_empty() {
-                        flush_concurrent(&mut store, &instance, &mut async_run).await;
-                    }
-                    call_func(&mut store, &instance, task).await;
+        // Process tasks in order, batching consecutive async tasks into
+        // dispatch_concurrent while executing sync tasks between them.
+        for task in batch.drain(..) {
+            if task.func_type.async_() {
+                async_run.push(task);
+            } else {
+                // Flush accumulated async run before the sync task.
+                if !async_run.is_empty() {
+                    dispatch_concurrent(&mut store, &instance, &mut async_run).await;
                 }
-            }
-            // Flush trailing async run.
-            if !async_run.is_empty() {
-                flush_concurrent(&mut store, &instance, &mut async_run).await;
+                dispatch_async(&mut store, &instance, &mut vec![task]).await;
             }
         }
-
-        #[cfg(not(feature = "component-model-async"))]
-        {
-            for task in batch.drain(..) {
-                call_func(&mut store, &instance, task).await;
-            }
+        // Flush trailing async run.
+        if !async_run.is_empty() {
+            dispatch_concurrent(&mut store, &instance, &mut async_run).await;
         }
     }
 }
 
-/// Flush a run of consecutive async tasks via `run_concurrent` + `call_concurrent`.
+#[cfg(not(feature = "component-model-async"))]
+async fn inbox_loop<T: Send + 'static>(
+    mut store: Store<T>,
+    instance: Instance,
+    mut rx: mpsc::UnboundedReceiver<ChannelTask>,
+) {
+    let mut batch = Vec::new();
+    while rx.recv_many(&mut batch, usize::MAX).await > 0 {
+        dispatch_async(&mut store, &instance, &mut batch).await;
+    }
+}
+
+/// Dispatch tasks concurrently via `run_concurrent` + `call_concurrent`.
 ///
 /// Drains `tasks` and sends replies. If `run_concurrent` fails (e.g.
 /// `concurrency_support` disabled in engine config), reply channels are dropped
-/// and callers receive `ActorStopped`.
+/// and callers receive `Unavailable`.
 #[cfg(feature = "component-model-async")]
-async fn flush_concurrent<T: Send + 'static>(
+async fn dispatch_concurrent<T: Send + 'static>(
     store: &mut Store<T>,
     instance: &Instance,
-    tasks: &mut Vec<CallTask>,
+    tasks: &mut Vec<ChannelTask>,
 ) {
     // Resolve Func handles while we still have &mut store.
     let funcs: Vec<_> = tasks
@@ -135,21 +179,29 @@ async fn flush_concurrent<T: Send + 'static>(
         .await;
 }
 
-/// Process a single function call task using `call_async`.
-async fn call_func<T: Send>(store: &mut Store<T>, instance: &Instance, task: CallTask) {
-    // SAFETY: caller awaits reply before dropping data.
-    let (params, results) = unsafe { (&*task.data.params, &mut *task.data.results) };
-    let result = match instance.get_func(&mut *store, &task.export_index) {
-        Some(func) => match func.call_async(&mut *store, params, results).await {
-            Ok(()) => func
-                .post_return_async(&mut *store)
-                .await
-                .map_err(CompositionError::from),
-            Err(e) => Err(CompositionError::from(e)),
-        },
-        None => Err(CompositionError::FuncNotFound),
-    };
-    let _ = task.reply.send(result);
+/// Dispatch tasks sequentially via `call_async` + `post_return_async`.
+///
+/// Drains `tasks` and sends replies.
+async fn dispatch_async<T: Send>(
+    store: &mut Store<T>,
+    instance: &Instance,
+    tasks: &mut Vec<ChannelTask>,
+) {
+    for task in tasks.drain(..) {
+        // SAFETY: caller awaits reply before dropping data.
+        let (params, results) = unsafe { (&*task.data.params, &mut *task.data.results) };
+        let result = match instance.get_func(&mut *store, &task.export_index) {
+            Some(func) => match func.call_async(&mut *store, params, results).await {
+                Ok(()) => func
+                    .post_return_async(&mut *store)
+                    .await
+                    .map_err(CompositionError::from),
+                Err(e) => Err(CompositionError::from(e)),
+            },
+            None => Err(CompositionError::FuncNotFound),
+        };
+        let _ = task.reply.send(result);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,13 +210,13 @@ async fn call_func<T: Send>(store: &mut Store<T>, instance: &Instance, task: Cal
 
 /// A composable backed by a wasmtime Instance.
 ///
-/// The underlying [`Store`] is owned by a background actor task and accessed
-/// exclusively through an internal channel — no `Arc<Mutex>` needed.
+/// The underlying [`Store`] is owned by a background inbox loop task and
+/// accessed exclusively through an internal channel — no `Arc<Mutex>` needed.
 /// This makes `ComposableInstance` non-generic over the store data type `T`;
 /// the type is erased at construction time.
 pub struct ComposableInstance {
-    /// Strong sender — keeps the actor alive while this instance exists.
-    tx: mpsc::UnboundedSender<CallTask>,
+    /// Strong sender — keeps the inbox loop alive while this instance exists.
+    tx: mpsc::UnboundedSender<ChannelTask>,
     ty: ComposableType,
     export_types: HashMap<String, ComponentItem>,
     component: Component,
@@ -173,7 +225,7 @@ pub struct ComposableInstance {
 impl ComposableInstance {
     /// Create a new composable instance.
     ///
-    /// Spawns a background actor task on the current tokio runtime that
+    /// Spawns a background inbox loop task on the current tokio runtime that
     /// owns the store and processes all function calls.
     ///
     /// # Panics
@@ -201,7 +253,7 @@ impl ComposableInstance {
             .collect();
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_actor(store, instance, rx));
+        tokio::spawn(inbox_loop(store, instance, rx));
 
         Self {
             tx,
@@ -286,7 +338,7 @@ impl Composable for ComposableInstance {
 }
 
 impl ComposableInstance {
-    /// Build an `ExportFunc` that sends a call task to the actor.
+    /// Build an `ExportFunc` that sends a channel task to the inbox loop.
     fn make_export_func(
         &self,
         export_index: ComponentExportIndex,
@@ -301,18 +353,7 @@ impl ComposableInstance {
                 params: params as *const [Val],
                 results: results as *mut [Val],
             };
-            Box::pin(async move {
-                let tx = tx.upgrade().ok_or(CompositionError::ActorStopped)?;
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                tx.send(CallTask {
-                    export_index,
-                    func_type,
-                    data,
-                    reply: reply_tx,
-                })
-                .map_err(|_| CompositionError::ActorStopped)?;
-                reply_rx.await.map_err(|_| CompositionError::ActorStopped)?
-            })
+            Box::pin(send_call(tx, export_index, func_type, data))
         })
     }
 
@@ -372,31 +413,15 @@ impl ComposableInstance {
                 name,
                 Box::new(move |params: &[Val], results: &mut [Val]| {
                     let tx = tx.clone();
-                    let export_index = export_index.clone();
                     let func_type = func_type.clone();
                     let data = RawCallData {
                         params: params as *const [Val],
                         results: results as *mut [Val],
                     };
                     Box::pin(async move {
-                        let tx = tx
-                            .upgrade()
-                            .ok_or_else(|| wasmtime::Error::msg("actor stopped"))?;
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        tx.send(CallTask {
-                            export_index,
-                            func_type,
-                            data,
-                            reply: reply_tx,
-                        })
-                        .map_err(|_| wasmtime::Error::msg("actor stopped"))?;
-                        reply_rx
+                        send_call(tx, export_index, func_type, data)
                             .await
-                            .map_err(|_| wasmtime::Error::msg("actor stopped"))?
-                            .map_err(|e| match e {
-                                CompositionError::Runtime(e) => e,
-                                other => wasmtime::Error::msg(other.to_string()),
-                            })
+                            .map_err(into_wasmtime_error)
                     })
                 }),
             );
@@ -406,31 +431,15 @@ impl ComposableInstance {
             name,
             Box::new(move |params: &[Val], results: &mut [Val]| {
                 let tx = tx.clone();
-                let export_index = export_index.clone();
                 let func_type = func_type.clone();
                 let data = RawCallData {
                     params: params as *const [Val],
                     results: results as *mut [Val],
                 };
                 Box::pin(async move {
-                    let tx = tx
-                        .upgrade()
-                        .ok_or_else(|| wasmtime::Error::msg("actor stopped"))?;
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    tx.send(CallTask {
-                        export_index,
-                        func_type,
-                        data,
-                        reply: reply_tx,
-                    })
-                    .map_err(|_| wasmtime::Error::msg("actor stopped"))?;
-                    reply_rx
+                    send_call(tx, export_index, func_type, data)
                         .await
-                        .map_err(|_| wasmtime::Error::msg("actor stopped"))?
-                        .map_err(|e| match e {
-                            CompositionError::Runtime(e) => e,
-                            other => wasmtime::Error::msg(other.to_string()),
-                        })
+                        .map_err(into_wasmtime_error)
                 })
             }),
         )
