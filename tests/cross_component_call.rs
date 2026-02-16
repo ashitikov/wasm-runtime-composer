@@ -2,8 +2,7 @@ use wasmtime::component::{Component, Linker, ResourceTable, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use wasm_runtime_composer::composable_instance::ComposableInstance;
-use wasm_runtime_composer::{Composable, ComposableDescriptor, CompositionBuilder};
+use wasm_runtime_composer::{Composable, ComposableDescriptor, ComposableInstance, CompositionBuilder, ResourceProxyView};
 
 struct TestState {
     ctx: WasiCtx,
@@ -25,6 +24,12 @@ impl WasiView for TestState {
             ctx: &mut self.ctx,
             table: &mut self.table,
         }
+    }
+}
+
+impl ResourceProxyView for TestState {
+    fn proxy_table(&mut self) -> &mut ResourceTable {
+        &mut self.table
     }
 }
 

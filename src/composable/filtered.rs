@@ -1,6 +1,6 @@
-use crate::CompositionError;
-use crate::composable::{Composable, ComposableType, ExportFunc, ResolvedImport};
-use crate::linker_ops::LinkerOps;
+use crate::error::CompositionError;
+use super::{Composable, ComposableType, ExportFunc, ResolvedImport};
+use super::linker_ops::LinkerOps;
 
 /// Decorator that wraps any `Composable` with pre-filtered exports.
 pub struct Filtered<C: Composable> {

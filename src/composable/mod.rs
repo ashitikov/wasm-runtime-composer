@@ -1,3 +1,8 @@
+pub mod composition;
+pub mod filtered;
+pub mod instance;
+pub mod linker_ops;
+
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::future::Future;
@@ -5,8 +10,8 @@ use std::future::Future;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{ComponentExportIndex, Val};
 
-use crate::CompositionError;
-use crate::linker_ops::LinkerOps;
+use crate::error::CompositionError;
+use linker_ops::LinkerOps;
 
 /// Set of interface names (exports or imports).
 pub type InterfaceSet = HashSet<String>;

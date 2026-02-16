@@ -1,8 +1,11 @@
+pub mod builder;
+pub mod descriptor;
+
 use std::collections::HashMap;
 
 use crate::composable::{Composable, ComposableType, ExportFunc, ResolvedImport};
-use crate::CompositionError;
-use crate::linker_ops::LinkerOps;
+use crate::composable::linker_ops::LinkerOps;
+use crate::error::CompositionError;
 
 /// An immutable graph of linked composables.
 pub struct Composition {

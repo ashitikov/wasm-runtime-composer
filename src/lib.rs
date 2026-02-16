@@ -1,19 +1,13 @@
-mod composable;
-mod composition;
-mod composition_builder;
-mod descriptor;
-mod error;
-mod filtered;
+pub mod error;
 mod priority_pool;
-pub mod composable_instance;
-pub mod linker_ops;
+pub mod composable;
 
 pub use composable::{Composable, ComposableType, ExportFunc, InterfaceSet};
-pub use composition::Composition;
-pub use composition_builder::CompositionBuilder;
-pub use descriptor::ComposableDescriptor;
+pub use composable::instance::{ComposableInstance, ResourceProxyView};
+pub use composable::composition::Composition;
+pub use composable::composition::builder::CompositionBuilder;
+pub use composable::composition::descriptor::ComposableDescriptor;
+pub use composable::filtered::{ExportFilter, Filtered};
 pub use error::CompositionError;
-pub use filtered::{ExportFilter, Filtered};
-pub use priority_pool::{PoolGuard, PriorityPool};
 
 pub use wasmtime;

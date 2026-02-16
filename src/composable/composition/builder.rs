@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::composable::{Composable, ComposableType, InterfaceSet, ResolvedImport};
-use crate::composition::Composition;
-use crate::descriptor::ComposableDescriptor;
 use crate::error::CompositionError;
+use super::Composition;
+use super::descriptor::ComposableDescriptor;
 
 /// Builder for creating a Composition.
 pub struct CompositionBuilder {
