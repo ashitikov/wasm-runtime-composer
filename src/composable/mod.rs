@@ -124,14 +124,6 @@ pub trait Composable: Send + Sync {
     /// Get the type signature (imports/exports) of this composable.
     fn ty(&self) -> &ComposableType;
 
-    /// Get the underlying wasmtime Component, if available.
-    ///
-    /// Returns `Some` for composables backed by a real wasm component
-    /// (e.g. `ComposableInstance`), `None` otherwise.
-    fn component(&self) -> Option<&wasmtime::component::Component> {
-        None
-    }
-
     /// Resolve an exported function into a pre-resolved handle.
     ///
     /// - `interface`: `None` for top-level exports, `Some("ns:pkg/iface@ver")`
