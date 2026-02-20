@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use wasmtime::AsContextMut;
 use wasmtime::component::types::{self, ResourceType};
@@ -6,7 +7,9 @@ use wasmtime::component::{
     LinkerInstance, Resource, ResourceAny, ResourceDynamic, ResourceTable,
 };
 
-use crate::composable::linker_ops::{BoxedAsyncFunc, LinkContext, LinkerOps, ValVisitor};
+use crate::composable::linker_ops::{
+    BoxedAsyncFunc, LinkContext, LinkerOps, ResourceMap, ValVisitor,
+};
 #[cfg(feature = "component-model-async")]
 use crate::composable::linker_ops::BoxedConcurrentFunc;
 use crate::error::CompositionError;
@@ -33,7 +36,7 @@ struct ParamsVisitor<'a, 'b, T: ResourceProxyView + 'static>(
 );
 
 impl<T: ResourceProxyView + 'static> ValVisitor<ResourceAny> for ParamsVisitor<'_, '_, T> {
-    fn visit(&mut self, ra: &mut ResourceAny, _ty_id: u32) -> wasmtime::Result<()> {
+    fn visit(&mut self, ra: &mut ResourceAny, _ty: ResourceType) -> wasmtime::Result<()> {
         if let Ok(rd) = ResourceDynamic::try_from_resource_any(*ra, &mut *self.0) {
             let proxy_id = rd.rep();
             if let Ok(producer_ra) = self
@@ -50,36 +53,88 @@ impl<T: ResourceProxyView + 'static> ValVisitor<ResourceAny> for ParamsVisitor<'
 }
 
 /// Results visitor: producer `ResourceAny` → consumer proxy handle.
-struct ResultsVisitor<'a, 'b, T: ResourceProxyView + 'static>(
-    &'a mut wasmtime::StoreContextMut<'b, T>,
-);
+///
+/// Uses `resource_map` from `LinkContext` to look up the consumer's `ty_id`
+/// for each producer `ResourceType`.
+struct ResultsVisitor<'a, 'b, 'c, T: ResourceProxyView + 'static> {
+    store: &'a mut wasmtime::StoreContextMut<'b, T>,
+    resource_map: &'c [(ResourceType, u32)],
+}
 
-impl<T: ResourceProxyView + 'static> ValVisitor<ResourceAny> for ResultsVisitor<'_, '_, T> {
-    fn visit(&mut self, ra: &mut ResourceAny, ty_id: u32) -> wasmtime::Result<()> {
+impl<T: ResourceProxyView + 'static> ValVisitor<ResourceAny> for ResultsVisitor<'_, '_, '_, T> {
+    fn visit(&mut self, ra: &mut ResourceAny, ty: ResourceType) -> wasmtime::Result<()> {
+        let ty_id = self
+            .resource_map
+            .iter()
+            .find(|(rt, _)| *rt == ty)
+            .map(|(_, id)| *id);
+        let Some(ty_id) = ty_id else {
+            // No mapping — leave ResourceAny as-is (no proxying active).
+            return Ok(());
+        };
         let rep = self
-            .0
+            .store
             .data_mut()
             .proxy_table()
             .push(*ra)
             .expect("resource table full")
             .rep();
         let rd = ResourceDynamic::new_own(rep, ty_id);
-        *ra = rd.try_into_resource_any(&mut *self.0)?;
+        *ra = rd.try_into_resource_any(&mut *self.store)?;
         Ok(())
     }
 }
 
-impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for LinkerInstance<'a, T> {
+// ---------------------------------------------------------------------------
+// ComposableLinker — the sole LinkerOps implementor for wasmtime types
+// ---------------------------------------------------------------------------
+
+/// A linker that handles cross-store value proxying for compositions.
+///
+/// Wraps a wasmtime [`LinkerInstance`] and tracks resource type registrations.
+/// When the producer registers resources via [`LinkerOps::resource`],
+/// `ComposableLinker` generates a unique `ty_id`, registers a `host_dynamic`
+/// resource with wasmtime, and stores the `(ResourceType, ty_id)` mapping.
+///
+/// When functions are registered, the mapping is injected into
+/// [`LinkContext::resource_map`] so that resource values in params/results
+/// are automatically proxied between stores.
+pub struct ComposableLinker<'a, T: ResourceProxyView + Send + 'static> {
+    inner: LinkerInstance<'a, T>,
+    resource_map: ResourceMap,
+    next_ty_id: Arc<AtomicU32>,
+}
+
+impl<'a, T: ResourceProxyView + Send + 'static> ComposableLinker<'a, T> {
+    pub fn new(inner: LinkerInstance<'a, T>) -> Self {
+        Self {
+            inner,
+            resource_map: Vec::new(),
+            next_ty_id: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn new_child(inner: LinkerInstance<'a, T>, next_ty_id: Arc<AtomicU32>) -> Self {
+        Self {
+            inner,
+            resource_map: Vec::new(),
+            next_ty_id,
+        }
+    }
+}
+
+impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for ComposableLinker<'a, T> {
     fn func_new_async(
         &mut self,
         name: &str,
         func: BoxedAsyncFunc,
-        ctx: LinkContext,
+        mut ctx: LinkContext,
     ) -> Result<(), CompositionError> {
+        ctx.resource_map = Some(Arc::new(self.resource_map.clone()));
         let ctx = Arc::new(ctx);
         let func = Arc::new(func);
         LinkerInstance::func_new_async(
-            self,
+            &mut self.inner,
             name,
             move |mut store, _ty: types::ComponentFunc, params, results| {
                 let ctx = ctx.clone();
@@ -89,7 +144,17 @@ impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for LinkerInstance<'a,
                         .unwrap_or_else(|_| std::borrow::Cow::Borrowed(params));
                 Box::new(async move {
                     func(&effective_params, results).await?;
-                    (ctx.resource.results)(results, &mut ResultsVisitor(&mut store))?;
+                    let map: &[(ResourceType, u32)] = match &ctx.resource_map {
+                        Some(m) => m,
+                        None => &[],
+                    };
+                    (ctx.resource.results)(
+                        results,
+                        &mut ResultsVisitor {
+                            store: &mut store,
+                            resource_map: map,
+                        },
+                    )?;
                     Ok(())
                 })
             },
@@ -102,12 +167,13 @@ impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for LinkerInstance<'a,
         &mut self,
         name: &str,
         func: BoxedConcurrentFunc,
-        ctx: LinkContext,
+        mut ctx: LinkContext,
     ) -> Result<(), CompositionError> {
+        ctx.resource_map = Some(Arc::new(self.resource_map.clone()));
         let ctx = Arc::new(ctx);
         let func = Arc::new(func);
         LinkerInstance::func_new_concurrent(
-            self,
+            &mut self.inner,
             name,
             move |accessor, _ty: types::ComponentFunc, params, results| {
                 let effective_params = accessor.with(|mut access| {
@@ -122,7 +188,17 @@ impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for LinkerInstance<'a,
                     func(&effective_params, results).await?;
                     accessor.with(|mut access| {
                         let mut store = access.as_context_mut();
-                        (ctx.resource.results)(results, &mut ResultsVisitor(&mut store))
+                        let map: &[(ResourceType, u32)] = match &ctx.resource_map {
+                            Some(m) => m,
+                            None => &[],
+                        };
+                        (ctx.resource.results)(
+                            results,
+                            &mut ResultsVisitor {
+                                store: &mut store,
+                                resource_map: map,
+                            },
+                        )
                     })
                 })
             },
@@ -135,13 +211,16 @@ impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for LinkerInstance<'a,
         name: &str,
         ty: ResourceType,
     ) -> Result<(), CompositionError> {
-        LinkerInstance::resource_async(self, name, ty, move |mut store, rep| {
+        let ty_id = self.next_ty_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let host_ty = ResourceType::host_dynamic(ty_id);
+        LinkerInstance::resource_async(&mut self.inner, name, host_ty, move |mut store, rep| {
             let _ = store
                 .data_mut()
                 .proxy_table()
                 .delete(Resource::<ResourceAny>::new_own(rep));
             Box::new(async { Ok(()) })
         })?;
+        self.resource_map.push((ty, ty_id));
         Ok(())
     }
 
@@ -150,7 +229,8 @@ impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for LinkerInstance<'a,
         name: &str,
         f: Box<dyn FnOnce(&mut dyn LinkerOps) -> Result<(), CompositionError> + 'b>,
     ) -> Result<(), CompositionError> {
-        let mut instance = LinkerInstance::instance(self, name)?;
-        f(&mut instance)
+        let child = LinkerInstance::instance(&mut self.inner, name)?;
+        let mut child_linker = ComposableLinker::new_child(child, self.next_ty_id.clone());
+        f(&mut child_linker)
     }
 }

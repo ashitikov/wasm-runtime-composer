@@ -1,9 +1,14 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use wasmtime::component::types::ResourceType;
 use wasmtime::component::{ResourceAny, Val};
 
 use crate::error::CompositionError;
+
+/// Mapping from producer's `ResourceType` to consumer's `ty_id`
+/// (the payload used in `ResourceType::host_dynamic`).
+pub type ResourceMap = Vec<(ResourceType, u32)>;
 
 /// Visitor for cross-store value remapping.
 ///
@@ -14,7 +19,7 @@ use crate::error::CompositionError;
 /// Direction is determined by which visitor instance is passed,
 /// not by which method is called.
 pub trait ValVisitor<V> {
-    fn visit(&mut self, val: &mut V, ty_id: u32) -> wasmtime::Result<()>;
+    fn visit(&mut self, val: &mut V, ty: ResourceType) -> wasmtime::Result<()>;
 }
 
 /// Pre-compiled navigator for results (in-place on `&mut [Val]`).
@@ -56,6 +61,9 @@ impl ValMapper {
 /// Always present (no Option). Default — no-op mappers.
 pub struct LinkContext {
     pub resource: ValMapper,
+    /// Resource type mapping provided by `ComposableLinker`.
+    /// `None` when no resource proxying is active.
+    pub resource_map: Option<Arc<ResourceMap>>,
 }
 
 impl LinkContext {
@@ -63,6 +71,7 @@ impl LinkContext {
     pub fn noop() -> Self {
         Self {
             resource: ValMapper::noop(),
+            resource_map: None,
         }
     }
 }
@@ -94,7 +103,7 @@ pub trait LinkerOps {
 
     /// Register a resource type.
     ///
-    /// The implementation provides the appropriate destructor for its store type.
+    /// Implemented by [`ComposableLinker`].
     fn resource(
         &mut self,
         name: &str,

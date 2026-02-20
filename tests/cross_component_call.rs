@@ -2,7 +2,7 @@ use wasmtime::component::{Component, Linker, ResourceTable, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use wasm_runtime_composer::{Composable, ComposableDescriptor, ComposableInstance, CompositionBuilder, ResourceProxyView};
+use wasm_runtime_composer::{Composable, ComposableDescriptor, ComposableInstance, CompositionBuilder, ResourceProxyView, ComposableLinker};
 
 struct TestState {
     ctx: WasiCtx,
@@ -70,10 +70,11 @@ async fn make_composition(engine: &Engine) -> wasm_runtime_composer::Composition
     let mut linker_consumer: Linker<TestState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker_consumer).unwrap();
     {
-        let mut root = linker_consumer.root();
-        composable_producer.link_export("add", &mut root).unwrap();
+        let root = linker_consumer.root();
+        let mut composable_linker = ComposableLinker::new(root);
+        composable_producer.link_export("add", &mut composable_linker).unwrap();
         composable_producer
-            .link_export("composer:test/iproducer", &mut root)
+            .link_export("composer:test/iproducer", &mut composable_linker)
             .unwrap();
     }
     let mut store_consumer = Store::new(engine, TestState::new());

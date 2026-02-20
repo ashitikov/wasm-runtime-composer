@@ -4,9 +4,9 @@ mod link;
 mod linker_impl;
 
 pub use linker_impl::ResourceProxyView;
+pub use linker_impl::ComposableLinker;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU32;
 
 use tokio::sync::mpsc;
 use wasmtime::Store;
@@ -19,10 +19,6 @@ use crate::error::CompositionError;
 
 use channel::{ChannelTask, RawCallData, send_call};
 use inbox::inbox_loop;
-
-/// Global counter for unique `ResourceType::host_dynamic` payloads.
-/// Used by `link_export_instance` to assign per-resource-type IDs.
-static NEXT_RESOURCE_TY_ID: AtomicU32 = AtomicU32::new(0);
 
 /// A composable backed by a wasmtime Instance.
 ///
@@ -53,23 +49,19 @@ impl ComposableInstance {
         let component_type = component.component_type();
         let engine = instance_pre.engine();
 
-        let exports: InterfaceSet = component_type
+        let export_types: HashMap<String, ComponentItem> = component_type
             .exports(engine)
-            .map(|(name, _)| name.to_string())
+            .map(|(name, ty)| (name.to_string(), ty))
             .collect();
+
+        let exports: InterfaceSet = export_types.keys().cloned().collect();
 
         let imports: InterfaceSet = component_type
             .imports(engine)
             .map(|(name, _)| name.to_string())
             .collect();
 
-        let export_types: HashMap<String, ComponentItem> = component_type
-            .exports(engine)
-            .map(|(name, ty)| (name.to_string(), ty))
-            .collect();
-
         let (tx, rx) = mpsc::unbounded_channel();
-        // TODO: do we need here to store joinhandle? And abort task probably on drop of ComposableInstance?
         tokio::spawn(inbox_loop(store, instance, rx));
 
         Self {
@@ -165,6 +157,6 @@ impl Composable for ComposableInstance {
         let export_type = self.export_types.get(name).ok_or_else(|| {
             CompositionError::LinkingError(format!("Export '{}' not found", name))
         })?;
-        self.link_export_item(name, &export_type, None, linker, &[])
+        self.link_export_item(name, &export_type, None, linker)
     }
 }

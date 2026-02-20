@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use wasmtime::component::Val;
 use wasmtime::component::types::{ComponentFunc, ComponentInstance, ComponentItem, Type};
-use wasmtime::component::{ComponentExportIndex, ResourceAny, ResourceType};
+use wasmtime::component::{ComponentExportIndex, ResourceAny};
 
 use crate::composable::linker_ops::{
     LinkContext, LinkerOps, ParamsMapper, ValMapper, ResultsMapper, ValVisitor,
@@ -10,7 +10,6 @@ use crate::composable::linker_ops::{
 use crate::error::CompositionError;
 
 use super::ComposableInstance;
-use super::NEXT_RESOURCE_TY_ID;
 use super::channel::{RawCallData, into_wasmtime_error, send_call};
 
 // ---------------------------------------------------------------------------
@@ -22,16 +21,13 @@ type ValNavigator = Arc<
 >;
 
 /// Build a navigator for a single `Val`. Returns `None` if the type contains no resources.
-fn build_val_navigator(
-    ty: &Type,
-    resource_map: &[(ResourceType, u32)],
-) -> Option<ValNavigator> {
+fn build_val_navigator(ty: &Type) -> Option<ValNavigator> {
     match ty {
         Type::Own(rt) | Type::Borrow(rt) => {
-            let ty_id = resource_map.iter().find(|(r, _)| *r == *rt)?.1;
+            let rt = *rt;
             Some(Arc::new(move |val, visitor| {
                 if let Val::Resource(ra) = val {
-                    visitor.visit(ra, ty_id)?;
+                    visitor.visit(ra, rt)?;
                 }
                 Ok(())
             }))
@@ -41,7 +37,7 @@ fn build_val_navigator(
                 .fields()
                 .enumerate()
                 .filter_map(|(i, field)| {
-                    build_val_navigator(&field.ty, resource_map).map(|nav| (i, nav))
+                    build_val_navigator(&field.ty).map(|nav| (i, nav))
                 })
                 .collect();
             if subs.is_empty() {
@@ -58,7 +54,7 @@ fn build_val_navigator(
         }
         Type::List(list) => {
             let inner_ty = list.ty();
-            let nav = build_val_navigator(&inner_ty, resource_map)?;
+            let nav = build_val_navigator(&inner_ty)?;
             Some(Arc::new(move |val, visitor| {
                 if let Val::List(items) = val {
                     for item in items.iter_mut() {
@@ -73,7 +69,7 @@ fn build_val_navigator(
                 .types()
                 .enumerate()
                 .filter_map(|(i, ty)| {
-                    build_val_navigator(&ty, resource_map).map(|nav| (i, nav))
+                    build_val_navigator(&ty).map(|nav| (i, nav))
                 })
                 .collect();
             if subs.is_empty() {
@@ -90,7 +86,7 @@ fn build_val_navigator(
         }
         Type::Option(opt) => {
             let inner_ty = opt.ty();
-            let nav = build_val_navigator(&inner_ty, resource_map)?;
+            let nav = build_val_navigator(&inner_ty)?;
             Some(Arc::new(move |val, visitor| {
                 if let Val::Option(Some(inner)) = val {
                     nav(inner, visitor)?;
@@ -101,10 +97,10 @@ fn build_val_navigator(
         Type::Result(result) => {
             let ok_nav = result
                 .ok()
-                .and_then(|ty| build_val_navigator(&ty, resource_map));
+                .and_then(|ty| build_val_navigator(&ty));
             let err_nav = result
                 .err()
-                .and_then(|ty| build_val_navigator(&ty, resource_map));
+                .and_then(|ty| build_val_navigator(&ty));
             if ok_nav.is_none() && err_nav.is_none() {
                 return None;
             }
@@ -129,7 +125,7 @@ fn build_val_navigator(
             let case_navs: Vec<(String, Option<ValNavigator>)> = variant
                 .cases()
                 .map(|case| {
-                    let nav = case.ty.and_then(|ty| build_val_navigator(&ty, resource_map));
+                    let nav = case.ty.and_then(|ty| build_val_navigator(&ty));
                     (case.name.to_string(), nav)
                 })
                 .collect();
@@ -153,19 +149,12 @@ fn build_val_navigator(
 }
 
 /// Build a `ValMapper` for a function type.
-fn build_resource_mapper(
-    func_ty: &ComponentFunc,
-    resource_map: &[(ResourceType, u32)],
-) -> ValMapper {
-    if resource_map.is_empty() {
-        return ValMapper::noop();
-    }
-
+fn build_resource_mapper(func_ty: &ComponentFunc) -> ValMapper {
     let param_navs: Vec<(usize, ValNavigator)> = func_ty
         .params()
         .enumerate()
         .filter_map(|(i, (_, ty))| {
-            build_val_navigator(&ty, resource_map).map(|nav| (i, nav))
+            build_val_navigator(&ty).map(|nav| (i, nav))
         })
         .collect();
 
@@ -173,7 +162,7 @@ fn build_resource_mapper(
         .results()
         .enumerate()
         .filter_map(|(i, ty)| {
-            build_val_navigator(&ty, resource_map).map(|nav| (i, nav))
+            build_val_navigator(&ty).map(|nav| (i, nav))
         })
         .collect();
 
@@ -212,14 +201,10 @@ fn build_resource_mapper(
 }
 
 /// Build a `LinkContext` for a function type.
-///
-/// If `resource_map` is empty, returns `LinkContext::noop()`.
-fn build_link_context(
-    func_ty: &ComponentFunc,
-    resource_map: &[(ResourceType, u32)],
-) -> LinkContext {
+fn build_link_context(func_ty: &ComponentFunc) -> LinkContext {
     LinkContext {
-        resource: build_resource_mapper(func_ty, resource_map),
+        resource: build_resource_mapper(func_ty),
+        resource_map: None,
     }
 }
 
@@ -234,11 +219,10 @@ impl ComposableInstance {
         item: &ComponentItem,
         parent: Option<&ComponentExportIndex>,
         linker: &mut dyn LinkerOps,
-        resource_map: &[(ResourceType, u32)],
     ) -> Result<(), CompositionError> {
         match item {
             ComponentItem::ComponentFunc(func_ty) => {
-                self.link_export_function(name, func_ty, parent, linker, resource_map)
+                self.link_export_function(name, func_ty, parent, linker)
             }
             ComponentItem::ComponentInstance(instance_ty) => {
                 self.link_export_instance(name, instance_ty, parent, linker)
@@ -247,7 +231,7 @@ impl ComposableInstance {
                 self.link_export_component(name, component_ty, parent, linker)
             }
             ComponentItem::Resource(resource_ty) => {
-                self.link_export_resource(name, resource_ty, parent, linker, resource_map)
+                linker.resource(name, *resource_ty)
             }
             ComponentItem::Type(_) => Ok(()),
             ComponentItem::CoreFunc(_) => Err(CompositionError::LinkingError(
@@ -265,7 +249,6 @@ impl ComposableInstance {
         func_ty: &ComponentFunc,
         parent: Option<&ComponentExportIndex>,
         linker: &mut dyn LinkerOps,
-        resource_map: &[(ResourceType, u32)],
     ) -> Result<(), CompositionError> {
         let export_index = self
             .component
@@ -277,7 +260,7 @@ impl ComposableInstance {
                 ))
             })?;
 
-        let ctx = build_link_context(func_ty, resource_map);
+        let ctx = build_link_context(func_ty);
 
         let tx = self.tx.downgrade();
         let func_type = func_ty.clone();
@@ -331,32 +314,10 @@ impl ComposableInstance {
     ) -> Result<(), CompositionError> {
         let items: Vec<_> = component_ty.imports(self.component.engine()).collect();
         for (name, item) in items {
-            self.link_export_item(name, &item, parent, linker, &[])?;
+            self.link_export_item(name, &item, parent, linker)?;
         }
 
         Ok(())
-    }
-
-    fn link_export_resource(
-        &self,
-        name: &str,
-        resource_ty: &ResourceType,
-        _parent: Option<&ComponentExportIndex>,
-        linker: &mut dyn LinkerOps,
-        resource_map: &[(ResourceType, u32)],
-    ) -> Result<(), CompositionError> {
-        let ty_id = resource_map
-            .iter()
-            .find(|(rt, _)| *rt == *resource_ty)
-            .map(|(_, id)| *id)
-            .ok_or_else(|| {
-                CompositionError::LinkingError(format!(
-                    "Resource '{}' has no proxy type ID in resource_map",
-                    name
-                ))
-            })?;
-        let ty = ResourceType::host_dynamic(ty_id);
-        linker.resource(name, ty)
     }
 
     fn link_export_instance(
@@ -382,31 +343,25 @@ impl ComposableInstance {
             .map(|(n, ty)| (n.to_string(), ty))
             .collect();
 
-        // Pass 1: build resource_map — each resource type gets a unique ty_id.
-        let resource_map: Vec<(ResourceType, u32)> = exports
-            .iter()
-            .filter_map(|(_, item)| match item {
-                ComponentItem::Resource(rt) => Some((
-                    *rt,
-                    NEXT_RESOURCE_TY_ID
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                )),
-                _ => None,
-            })
-            .collect();
-
-        // Pass 2: link all exports with the resource_map.
         linker.with_instance(
             name,
             Box::new(move |sub_linker| {
+                // Pass 1: register resources via linker (ComposableLinker stores the mapping).
                 for (export_name, export_ty) in &exports {
-                    self.link_export_item(
-                        export_name,
-                        export_ty,
-                        Some(&instance_export_index),
-                        sub_linker,
-                        &resource_map,
-                    )?;
+                    if let ComponentItem::Resource(rt) = export_ty {
+                        sub_linker.resource(export_name, *rt)?;
+                    }
+                }
+                // Pass 2: link everything else.
+                for (export_name, export_ty) in &exports {
+                    if !matches!(export_ty, ComponentItem::Resource(_)) {
+                        self.link_export_item(
+                            export_name,
+                            export_ty,
+                            Some(&instance_export_index),
+                            sub_linker,
+                        )?;
+                    }
                 }
                 Ok(())
             }),
