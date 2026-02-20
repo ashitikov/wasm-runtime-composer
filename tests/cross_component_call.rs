@@ -183,6 +183,30 @@ async fn test_cross_component_resource_func() {
     assert_eq!(results[0], Val::S32(42));
 }
 
+/// Resource borrow round-trip: consumer.run_pong_res_borrow() -> producer.get_pong(42) -> producer.get_pong_res_borrow(&pong) -> 42
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cross_component_resource_borrow() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let run_pong_res_borrow = composition.get_func(None, "run-pong-res-borrow").unwrap();
+    let mut results = vec![Val::S32(0)];
+    run_pong_res_borrow.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
+/// Nested resource round-trip: consumer.run_pong_res_nested() -> producer.get_pong_nested(42) -> producer.get_pong_res_nested(nested-pong) -> 42
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cross_component_resource_nested() {
+    let engine = test_engine();
+    let composition = make_composition(&engine).await;
+
+    let func = composition.get_func(None, "run-pong-res-nested").unwrap();
+    let mut results = vec![Val::S32(0)];
+    func.call(&[], &mut results).await.unwrap();
+    assert_eq!(results[0], Val::S32(42));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_single_thread_async() {
     let engine = test_engine();

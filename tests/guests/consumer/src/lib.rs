@@ -28,6 +28,16 @@ impl bindings::Guest for Consumer {
         let pong = bindings::composer::test::iproducer::get_pong(42);
         bindings::composer::test::iproducer::get_pong_res(pong).await
     }
+
+    async fn run_pong_res_borrow() -> i32 {
+        let pong = bindings::composer::test::iproducer::get_pong(42);
+        bindings::composer::test::iproducer::get_pong_res_borrow(&pong).await
+    }
+
+    async fn run_pong_res_nested() -> i32 {
+        let nested = bindings::composer::test::iproducer::get_pong_nested(42);
+        bindings::composer::test::iproducer::get_pong_res_nested(nested).await
+    }
 }
 
 impl bindings::exports::composer::test::iconsumer::Guest for Consumer {
@@ -47,5 +57,15 @@ impl bindings::exports::composer::test::iconsumer::Guest for Consumer {
     async fn run_pong_res() -> i32 {
         let pong = bindings::composer::test::iproducer::get_pong(42);
         bindings::composer::test::iproducer::get_pong_res(pong).await
+    }
+
+    async fn run_pong_res_borrow() -> i32 {
+        let pong = bindings::composer::test::iproducer::get_pong(42);
+        bindings::composer::test::iproducer::get_pong_res_borrow(&pong).await
+    }
+
+    async fn run_pong_res_nested() -> i32 {
+        let nested = bindings::composer::test::iproducer::get_pong_nested(42);
+        bindings::composer::test::iproducer::get_pong_res_nested(nested).await
     }
 }

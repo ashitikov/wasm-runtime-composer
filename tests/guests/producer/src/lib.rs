@@ -33,7 +33,21 @@ impl bindings::exports::composer::test::iproducer::Guest for Producer {
         bindings::exports::composer::test::iproducer::Pong::new(Pong { value: ping })
     }
 
+    fn get_pong_nested(ping: i32) -> iproducer::NestedPong {
+        iproducer::NestedPong {
+            pong: bindings::exports::composer::test::iproducer::Pong::new(Pong { value: ping }),
+        }
+    }
+
     async fn get_pong_res(pong: iproducer::Pong) -> i32 {
+        pong.get::<Pong>().value
+    }
+
+    async fn get_pong_res_nested(pong: iproducer::NestedPong) -> i32 {
+        pong.pong.get::<Pong>().value
+    }
+
+    async fn get_pong_res_borrow(pong: iproducer::PongBorrow<'_>) -> i32 {
         pong.get::<Pong>().value
     }
 }

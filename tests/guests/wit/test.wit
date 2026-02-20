@@ -5,9 +5,16 @@ interface iproducer {
         get: async func() -> s32;
     }
 
+    record nested-pong {
+        pong: pong
+    }
+
     ping: async func(ping: s32) -> s32;
     get-pong: func(ping: s32) -> pong;
+    get-pong-nested: func(ping: s32) -> nested-pong;
     get-pong-res: async func(pong: pong) -> s32;
+    get-pong-res-nested: async func(pong: nested-pong) -> s32;
+    get-pong-res-borrow: async func(pong: borrow<pong>) -> s32;
 }
 
 world producer {
@@ -20,6 +27,8 @@ interface iconsumer {
     run-ping: async func() -> s32;
     run-pong: async func() -> s32;
     run-pong-res: async func() -> s32;
+    run-pong-res-borrow: async func() -> s32;
+    run-pong-res-nested: async func() -> s32;
 }
 
 world consumer {
@@ -30,5 +39,7 @@ world consumer {
     export run-ping: async func() -> s32;
     export run-pong: async func() -> s32;
     export run-pong-res: async func() -> s32;
+    export run-pong-res-borrow: async func() -> s32;
+    export run-pong-res-nested: async func() -> s32;
     export iconsumer;
 }
