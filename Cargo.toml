@@ -2,23 +2,22 @@
 name = "wasm-runtime-composer"
 version = "0.1.0"
 edition = "2024"
+description = "Runtime composition of WebAssembly components using wasmtime"
 license = "MIT"
+authors = ["Alexander Shitikov <a.shitikov73@gmail.com>"]
+repository = "https://github.com/ashitikov/wasm-runtime-composer"
 
 [features]
 default = ["component-model-async"]
 component-model-async = ["wasmtime/component-model-async"]
 
 [dependencies]
-wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", features = ["async"] }
-wasmtime-environ = { git = "https://github.com/bytecodealliance/wasmtime" }
+wasmtime = { version = ">=42", features = ["async"] }
 thiserror = "2.0"
-anyhow = "1.0"
-priority-queue = "2.7"
 tokio = { version = "1", features = ["sync", "rt"] }
 futures = "0.3"
-async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-wasmtime = { git = "https://github.com/bytecodealliance/wasmtime" }
-wasmtime-wasi = { git = "https://github.com/bytecodealliance/wasmtime" }
+wasmtime = { version = ">=42" }
+wasmtime-wasi = { version = ">=42" }

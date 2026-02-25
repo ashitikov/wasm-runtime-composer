@@ -91,7 +91,7 @@ impl ExportFunc {
     }
 
     pub fn call<'a>(
-        &'a self,
+        &self,
         params: &'a [Val],
         results: &'a mut [Val],
     ) -> Pin<Box<dyn Future<Output = Result<(), CompositionError>> + Send + 'a>> {

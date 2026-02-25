@@ -160,13 +160,10 @@ async fn dispatch_async<T: Send>(
         // SAFETY: caller awaits reply before dropping data.
         let (params, results) = unsafe { (&*task.data.params, &mut *task.data.results) };
         let result = match instance.get_func(&mut *store, &task.export_index) {
-            Some(func) => match func.call_async(&mut *store, params, results).await {
-                Ok(()) => func
-                    .post_return_async(&mut *store)
-                    .await
-                    .map_err(CompositionError::from),
-                Err(e) => Err(CompositionError::from(e)),
-            },
+            Some(func) => func
+                .call_async(&mut *store, params, results)
+                .await
+                .map_err(CompositionError::from),
             None => Err(CompositionError::FuncNotFound),
         };
         let _ = task.reply.send(result);
