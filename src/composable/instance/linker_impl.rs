@@ -7,11 +7,11 @@ use wasmtime::component::{
     LinkerInstance, Resource, ResourceAny, ResourceDynamic, ResourceTable,
 };
 
-use crate::composable::linker_ops::{
-    BoxedAsyncFunc, LinkContext, LinkerOps, ResourceMap, ValVisitor,
+use crate::composable::linker_instance_ops::{
+    BoxedAsyncFunc, LinkContext, LinkerInstanceOps, ResourceMap, ValVisitor,
 };
 #[cfg(feature = "component-model-async")]
-use crate::composable::linker_ops::BoxedConcurrentFunc;
+use crate::composable::linker_instance_ops::BoxedConcurrentFunc;
 use crate::error::CompositionError;
 
 /// Trait for store data types (`T` in `Store<T>`) that support cross-store
@@ -86,13 +86,13 @@ impl<T: ResourceProxyView + 'static> ValVisitor<ResourceAny> for ResultsVisitor<
 }
 
 // ---------------------------------------------------------------------------
-// ComposableLinker — the sole LinkerOps implementor for wasmtime types
+// ComposableLinker — the sole LinkerInstanceOps implementor for wasmtime types
 // ---------------------------------------------------------------------------
 
 /// A linker that handles cross-store value proxying for compositions.
 ///
 /// Wraps a wasmtime [`LinkerInstance`] and tracks resource type registrations.
-/// When the producer registers resources via [`LinkerOps::resource`],
+/// When the producer registers resources via [`LinkerInstanceOps::resource`],
 /// `ComposableLinker` generates a unique `ty_id`, registers a `host_dynamic`
 /// resource with wasmtime, and stores the `(ResourceType, ty_id)` mapping.
 ///
@@ -123,7 +123,7 @@ impl<'a, T: ResourceProxyView + Send + 'static> ComposableLinker<'a, T> {
     }
 }
 
-impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for ComposableLinker<'a, T> {
+impl<'a, T: ResourceProxyView + Send + 'static> LinkerInstanceOps for ComposableLinker<'a, T> {
     fn func_new_async(
         &mut self,
         name: &str,
@@ -227,7 +227,7 @@ impl<'a, T: ResourceProxyView + Send + 'static> LinkerOps for ComposableLinker<'
     fn with_instance<'b>(
         &'b mut self,
         name: &str,
-        f: Box<dyn FnOnce(&mut dyn LinkerOps) -> Result<(), CompositionError> + 'b>,
+        f: Box<dyn FnOnce(&mut dyn LinkerInstanceOps) -> Result<(), CompositionError> + 'b>,
     ) -> Result<(), CompositionError> {
         let child = LinkerInstance::instance(&mut self.inner, name)?;
         let mut child_linker = ComposableLinker::new_child(child, self.next_ty_id.clone());

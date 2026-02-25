@@ -1,23 +1,23 @@
+pub mod component;
 pub mod composition;
 pub mod filtered;
 pub mod instance;
-pub mod linker_ops;
+pub mod linker_instance_ops;
 
 use std::collections::HashSet;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
-use wasmtime::component::types::ComponentItem;
-use wasmtime::component::{ComponentExportIndex, Val};
+use wasmtime::component::Val;
 
 use crate::error::CompositionError;
-use linker_ops::LinkerOps;
+use linker_instance_ops::LinkerInstanceOps;
 
 /// Set of interface names (exports or imports).
 pub type InterfaceSet = HashSet<String>;
 
 /// A resolved internal link between two composables.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ResolvedImport {
     /// ID of the composable that imports.
     pub importer_id: String,
@@ -25,22 +25,6 @@ pub struct ResolvedImport {
     pub exporter_id: String,
     /// Interface name.
     pub interface: String,
-    /// Wasmtime type of the linked item (populated during linking).
-    pub ty: Option<ComponentItem>,
-    /// Parent export index for nested exports (e.g. functions inside an instance).
-    pub parent_export_index: Option<ComponentExportIndex>,
-}
-
-impl std::fmt::Debug for ResolvedImport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedImport")
-            .field("importer_id", &self.importer_id)
-            .field("exporter_id", &self.exporter_id)
-            .field("interface", &self.interface)
-            .field("ty", &self.ty.as_ref().map(|_| ".."))
-            .field("parent_export_index", &self.parent_export_index.as_ref().map(|_| ".."))
-            .finish()
-    }
 }
 
 /// Type signature of a composable (what it exports and imports).
@@ -65,21 +49,18 @@ impl ComposableType {
 }
 
 impl ResolvedImport {
-    /// Create a new top-level resolved import (no type info yet).
     pub fn new(importer_id: String, exporter_id: String, interface: String) -> Self {
         Self {
             importer_id,
             exporter_id,
             interface,
-            ty: None,
-            parent_export_index: None,
         }
     }
 }
 
 /// Pre-resolved handle to an exported function.
 ///
-/// Obtained via [`Composable::get_func`]. The closure inside captures
+/// Obtained via [`Composition::get_func`]. The closure inside captures
 /// everything needed for the call (store, instance, export index), so
 /// no further lookups happen at call time.
 pub struct ExportFunc(
@@ -87,7 +68,8 @@ pub struct ExportFunc(
         dyn for<'a> Fn(
                 &'a [Val],
                 &'a mut [Val],
-            ) -> Pin<Box<dyn Future<Output = Result<(), CompositionError>> + Send + 'a>>
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), CompositionError>> + Send + 'a>>
             + Send
             + Sync,
     >,
@@ -99,7 +81,8 @@ impl ExportFunc {
         F: for<'a> Fn(
                 &'a [Val],
                 &'a mut [Val],
-            ) -> Pin<Box<dyn Future<Output = Result<(), CompositionError>> + Send + 'a>>
+            )
+                -> Pin<Box<dyn Future<Output = Result<(), CompositionError>> + Send + 'a>>
             + Send
             + Sync
             + 'static,
@@ -116,42 +99,42 @@ impl ExportFunc {
     }
 }
 
-/// A composable unit in the runtime graph.
+/// A composable unit — the composition-time API.
 ///
-/// Implemented by leaf components (single WASM component + pool)
-/// and by `Composition` (graph of linked composables).
-pub trait Composable: Send + Sync {
+/// Implemented by `ComposableInstance`, `ComposableComponent`, `Filtered`,
+/// and `Composition` (identity — for nesting a finalized composition).
+pub trait Composable: Send {
     /// Get the type signature (imports/exports) of this composable.
     fn ty(&self) -> &ComposableType;
 
-    /// Resolve an exported function into a pre-resolved handle.
-    ///
-    /// - `interface`: `None` for top-level exports, `Some("ns:pkg/iface@ver")`
-    ///   for functions inside an exported interface.
-    /// - `func`: the function name within that scope.
-    ///
-    /// The returned [`ExportFunc`] captures everything needed for the call,
-    /// so repeated invocations avoid redundant lookups.
-    fn get_func(&self, interface: Option<&str>, func: &str) -> Result<ExportFunc, CompositionError>;
-
-    /// Link a single resolved import.
-    ///
-    /// Called during composition building to wire up an import.
-    /// The exporter is passed directly so the importer can call
-    /// `exporter.link_export()` to get the functions it needs.
-    fn link_import(
-        &mut self,
-        import: &ResolvedImport,
-        exporter: &mut dyn Composable,
-    ) -> Result<(), CompositionError>;
-
-    /// Link a single export into the given linker.
-    ///
-    /// Called by the composition builder to wire up an export from this
-    /// composable into an importer's linker.
+    /// Link a single export into the importer's linker.
     fn link_export(
         &mut self,
         name: &str,
-        linker: &mut dyn LinkerOps,
+        importer_linker: &mut dyn LinkerInstanceOps,
     ) -> Result<(), CompositionError>;
+
+    /// Link a single import from the given exporter.
+    ///
+    /// Default returns an error — most composables don't accept import linking.
+    ///
+    /// `ComposableComponent` overrides this to register the exporter's
+    /// functions in its own `Linker<T>`.
+    fn link_import(
+        &mut self,
+        _name: &str,
+        _exporter: &mut dyn Composable,
+    ) -> Result<(), CompositionError> {
+        Err(CompositionError::LinkingError(
+            "this composable does not accept import linking".to_string(),
+        ))
+    }
+
+    /// Finalize into a running `Composition`.
+    ///
+    /// Consumes the composable. For `ComposableInstance` this spawns the inbox loop.
+    /// For `ComposableComponent` this creates a Store, instantiates, and spawns the inbox loop.
+    fn into_composition(
+        self: Box<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<composition::Composition, CompositionError>> + Send>>;
 }

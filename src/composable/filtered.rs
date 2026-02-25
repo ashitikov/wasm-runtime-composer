@@ -1,6 +1,10 @@
+use std::pin::Pin;
+use std::future::Future;
+
 use crate::error::CompositionError;
-use super::{Composable, ComposableType, ExportFunc, ResolvedImport};
-use super::linker_ops::LinkerOps;
+use super::{Composable, ComposableType};
+use super::composition::Composition;
+use super::linker_instance_ops::LinkerInstanceOps;
 
 /// Decorator that wraps any `Composable` with pre-filtered exports.
 pub struct Filtered<C: Composable> {
@@ -8,29 +12,35 @@ pub struct Filtered<C: Composable> {
     ty: ComposableType,
 }
 
-impl<C: Composable> Composable for Filtered<C> {
+impl<C: Composable + 'static> Composable for Filtered<C> {
     fn ty(&self) -> &ComposableType {
         &self.ty
-    }
-
-    fn get_func(&self, interface: Option<&str>, func: &str) -> Result<ExportFunc, CompositionError> {
-        self.inner.get_func(interface, func)
-    }
-
-    fn link_import(
-        &mut self,
-        import: &ResolvedImport,
-        exporter: &mut dyn Composable,
-    ) -> Result<(), CompositionError> {
-        self.inner.link_import(import, exporter)
     }
 
     fn link_export(
         &mut self,
         name: &str,
-        linker: &mut dyn LinkerOps,
+        importer_linker: &mut dyn LinkerInstanceOps,
     ) -> Result<(), CompositionError> {
-        self.inner.link_export(name, linker)
+        self.inner.link_export(name, importer_linker)
+    }
+
+    fn link_import(
+        &mut self,
+        name: &str,
+        exporter: &mut dyn Composable,
+    ) -> Result<(), CompositionError> {
+        self.inner.link_import(name, exporter)
+    }
+
+    fn into_composition(
+        self: Box<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<Composition, CompositionError>> + Send>> {
+        let filtered = *self;
+        Box::pin(async move {
+            let comp = Box::new(filtered.inner).into_composition().await?;
+            Ok(comp.with_ty(filtered.ty))
+        })
     }
 }
 

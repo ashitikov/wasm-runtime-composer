@@ -41,6 +41,9 @@ pub enum CompositionError {
     #[error("composable unavailable")]
     Unavailable,
 
+    #[error("component already instantiated")]
+    AlreadyInstantiated,
+
     #[error(transparent)]
     Runtime(#[from] wasmtime::Error),
 }

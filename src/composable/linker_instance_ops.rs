@@ -13,7 +13,7 @@ pub type ResourceMap = Vec<(ResourceType, u32)>;
 /// Visitor for cross-store value remapping.
 ///
 /// Generic over the value type `V` (e.g. `ResourceAny`).
-/// Implemented by the concrete `LinkerOps` implementation that has
+/// Implemented by the concrete `LinkerInstanceOps` implementation that has
 /// access to the store and knows `T`.
 ///
 /// Direction is determined by which visitor instance is passed,
@@ -80,7 +80,7 @@ impl LinkContext {
 ///
 /// This trait allows composables to add definitions to a linker
 /// without knowing the concrete store type `T`.
-pub trait LinkerOps {
+pub trait LinkerInstanceOps {
     /// Add an async function definition.
     fn func_new_async(
         &mut self,
@@ -114,7 +114,7 @@ pub trait LinkerOps {
     fn with_instance<'a>(
         &'a mut self,
         name: &str,
-        f: Box<dyn FnOnce(&mut dyn LinkerOps) -> Result<(), CompositionError> + 'a>,
+        f: Box<dyn FnOnce(&mut dyn LinkerInstanceOps) -> Result<(), CompositionError> + 'a>,
     ) -> Result<(), CompositionError>;
 }
 

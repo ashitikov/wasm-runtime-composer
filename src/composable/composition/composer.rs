@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::composable::{Composable, ComposableType, InterfaceSet, ResolvedImport};
 use crate::error::CompositionError;
@@ -6,12 +7,12 @@ use super::Composition;
 use super::descriptor::ComposableDescriptor;
 
 /// Builder for creating a Composition.
-pub struct CompositionBuilder {
+pub struct Composer {
     descriptors: Vec<ComposableDescriptor>,
     export_hints: HashMap<String, String>,
 }
 
-impl CompositionBuilder {
+impl Composer {
     pub fn new() -> Self {
         Self {
             descriptors: Vec::new(),
@@ -32,8 +33,8 @@ impl CompositionBuilder {
         self
     }
 
-    /// Build the composition, resolving all internal links.
-    pub fn build(self) -> Result<Composition, CompositionError> {
+    /// Compose all children: resolve imports, link, instantiate, and return the final Composition.
+    pub async fn compose(self) -> Result<Composition, CompositionError> {
         if self.descriptors.is_empty() {
             return Err(CompositionError::Empty);
         }
@@ -164,34 +165,71 @@ impl CompositionBuilder {
 
         let ty = ComposableType::new(resolved_exports, external_imports);
 
-        // 7. Link resolved imports: exporter provides functions to importer
+        // 7. Group resolved imports by importer
+        let mut imports_by_importer: HashMap<String, Vec<ResolvedImport>> = HashMap::new();
         for resolved in &resolved_imports {
-            // Take importer out to avoid double borrow on children map
-            let mut importer = children.remove(&resolved.importer_id).ok_or_else(|| {
-                CompositionError::LinkingError(format!(
-                    "Importer '{}' not found",
-                    resolved.importer_id
-                ))
-            })?;
-
-            let exporter = children.get_mut(&resolved.exporter_id).ok_or_else(|| {
-                CompositionError::LinkingError(format!(
-                    "Exporter '{}' not found",
-                    resolved.exporter_id
-                ))
-            })?;
-
-            importer.link_import(resolved, &mut **exporter)?;
-
-            children.insert(resolved.importer_id.clone(), importer);
+            imports_by_importer.entry(resolved.importer_id.clone())
+                .or_default().push(resolved.clone());
         }
 
-        // 8. Create Composition with provider map for routing
-        Ok(Composition::new(children, resolved_imports, ty, export_provider_map))
+        // 8. Link imports (sync — registers closures only)
+        for (id, imports) in &imports_by_importer {
+            let mut importer = children.remove(id).ok_or_else(|| {
+                CompositionError::LinkingError(format!(
+                    "Importer '{}' not found",
+                    id
+                ))
+            })?;
+
+            for import in imports {
+                let mut exporter = children.remove(&import.exporter_id)
+                    .ok_or_else(|| CompositionError::LinkingError(
+                        format!("Exporter '{}' not found", import.exporter_id)
+                    ))?;
+                importer.link_import(&import.interface, &mut *exporter)?;
+                children.insert(import.exporter_id.clone(), exporter);
+            }
+
+            children.insert(id.clone(), importer);
+        }
+
+        // 9. Convert each child into Composition
+        let mut composed: HashMap<String, Composition> = HashMap::new();
+        for (id, child) in children {
+            let comp = child.into_composition().await?;
+            composed.insert(id, comp);
+        }
+
+        // 10. Assemble outer Composition with closures
+        let children = Arc::new(composed);
+        let epm = Arc::new(export_provider_map);
+
+        let children_for_func = children.clone();
+        let epm_for_func = epm.clone();
+
+        Ok(Composition::new(
+            Box::new(move |iface, func| {
+                let lookup = iface.unwrap_or(func);
+                let id = epm_for_func.get(lookup)
+                    .ok_or(CompositionError::FuncNotFound)?;
+                children_for_func.get(id)
+                    .ok_or(CompositionError::FuncNotFound)?
+                    .get_func(iface, func)
+            }),
+            Box::new(move |name, importer_linker| {
+                let id = epm.get(name)
+                    .ok_or(CompositionError::FuncNotFound)?;
+                children.get(id)
+                    .ok_or(CompositionError::FuncNotFound)?
+                    .link_export(name, importer_linker)
+            }),
+            ty,
+            resolved_imports,
+        ))
     }
 }
 
-impl Default for CompositionBuilder {
+impl Default for Composer {
     fn default() -> Self {
         Self::new()
     }

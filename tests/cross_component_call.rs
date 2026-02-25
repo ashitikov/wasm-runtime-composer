@@ -2,7 +2,7 @@ use wasmtime::component::{Component, Linker, ResourceTable, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use wasm_runtime_composer::{Composable, ComposableDescriptor, ComposableInstance, CompositionBuilder, ResourceProxyView, ComposableLinker};
+use wasm_runtime_composer::{Composable, ComposableDescriptor, ComposableInstance, Composer, ResourceProxyView, ComposableLinker};
 
 struct TestState {
     ctx: WasiCtx,
@@ -64,7 +64,7 @@ async fn make_composition(engine: &Engine) -> wasm_runtime_composer::Composition
         .instantiate_async(&mut store_producer, &producer_component)
         .await
         .unwrap();
-    let mut composable_producer = ComposableInstance::new(producer_instance, store_producer);
+    let mut composable_producer = ComposableInstance::from_existing(producer_instance, store_producer);
 
     // 2. Create consumer linker, link producer exports, then instantiate
     let mut linker_consumer: Linker<TestState> = Linker::new(engine);
@@ -82,16 +82,16 @@ async fn make_composition(engine: &Engine) -> wasm_runtime_composer::Composition
         .instantiate_async(&mut store_consumer, &consumer_component)
         .await
         .unwrap();
-    let composable_consumer = ComposableInstance::new(consumer_instance, store_consumer);
+    let composable_consumer = ComposableInstance::from_existing(consumer_instance, store_consumer);
 
     // 3. Build composition
     let producer_desc = ComposableDescriptor::new("producer", composable_producer);
     let consumer_desc = ComposableDescriptor::new("consumer", composable_consumer);
 
-    let mut builder = CompositionBuilder::new();
-    builder.add(producer_desc);
-    builder.add(consumer_desc);
-    builder.build().unwrap()
+    let mut composer = Composer::new();
+    composer.add(producer_desc);
+    composer.add(consumer_desc);
+    composer.compose().await.unwrap()
 }
 
 /// Sync cross-component call: consumer.run_add() -> producer.add(20, 22) -> 42
