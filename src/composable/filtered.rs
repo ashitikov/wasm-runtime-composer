@@ -7,12 +7,12 @@ use super::composition::Composition;
 use super::linker_instance_ops::LinkerInstanceOps;
 
 /// Decorator that wraps any `Composable` with pre-filtered exports.
-pub struct Filtered<C: Composable> {
+pub struct FilteredExports<C: Composable> {
     inner: C,
     ty: ComposableType,
 }
 
-impl<C: Composable + 'static> Composable for Filtered<C> {
+impl<C: Composable + 'static> Composable for FilteredExports<C> {
     fn ty(&self) -> &ComposableType {
         &self.ty
     }
@@ -47,7 +47,7 @@ impl<C: Composable + 'static> Composable for Filtered<C> {
 /// Extension methods for filtering exports of any `Composable`.
 pub trait ExportFilter: Composable + Sized {
     /// Filter exports by predicate on interface name.
-    fn filter_exports(self, f: impl Fn(&str) -> bool) -> Filtered<Self> {
+    fn filter_exports(self, f: impl Fn(&str) -> bool) -> FilteredExports<Self> {
         let ty = self.ty();
 
         let exports = ty
@@ -59,19 +59,19 @@ pub trait ExportFilter: Composable + Sized {
 
         let imports = ty.imports().clone();
 
-        Filtered {
+        FilteredExports {
             inner: self,
             ty: ComposableType::new(exports, imports),
         }
     }
 
     /// Keep only exports whose names are in `allow`.
-    fn exposing(self, allow: &[&str]) -> Filtered<Self> {
+    fn exposing(self, allow: &[&str]) -> FilteredExports<Self> {
         self.filter_exports(|name| allow.contains(&name))
     }
 
     /// Remove exports whose names are in `deny`; keep everything else.
-    fn hiding(self, deny: &[&str]) -> Filtered<Self> {
+    fn hiding(self, deny: &[&str]) -> FilteredExports<Self> {
         self.filter_exports(|name| !deny.contains(&name))
     }
 }

@@ -22,7 +22,7 @@ pub use composable::instance::{ComposableInstance, ComposableLinker, ResourcePro
 pub use composable::composition::Composition;
 pub use composable::composition::composer::Composer;
 pub use composable::composition::descriptor::ComposableDescriptor;
-pub use composable::filtered::{ExportFilter, Filtered};
+pub use composable::filtered::{ExportFilter, FilteredExports};
 pub use error::CompositionError;
 
 pub use wasmtime;

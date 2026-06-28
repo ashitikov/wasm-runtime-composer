@@ -70,7 +70,7 @@ impl Composition {
         (self.export_linker)(name, importer_linker)
     }
 
-    /// Replace the type signature (used by `Filtered::into_composition`).
+    /// Replace the type signature (used by `FilteredExports::into_composition`).
     pub(crate) fn with_ty(mut self, ty: ComposableType) -> Self {
         self.ty = ty;
         self

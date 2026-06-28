@@ -34,7 +34,14 @@ interface iconsumer {
 world consumer {
     import add: func(a: s32, b: s32) -> s32;
     import iproducer;
+    use iproducer.{pong};
 
+    // Hand a producer-minted resource straight back to the host, so a
+    // host outside the composition holds a proxy it must resolve.
+    export passthrough-pong: func() -> pong;
+    // Adversary: fabricate a pong handle from a raw guessed number and try
+    // to resolve it through the producer — the ABI must trap.
+    export forge-pong: async func(raw: u32) -> s32;
     export run-add: func() -> s32;
     export run-ping: async func() -> s32;
     export run-pong: async func() -> s32;

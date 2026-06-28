@@ -11,6 +11,18 @@ mod bindings {
 struct Consumer;
 
 impl bindings::Guest for Consumer {
+    fn passthrough_pong() -> bindings::composer::test::iproducer::Pong {
+        bindings::composer::test::iproducer::get_pong(42)
+    }
+
+    async fn forge_pong(raw: u32) -> i32 {
+        // Fabricate a handle from a raw guessed number and pass it on. The
+        // ABI validates the handle against this instance's own table when
+        // it is lowered into the call — an unowned number traps here.
+        let forged = unsafe { bindings::composer::test::iproducer::Pong::from_handle(raw) };
+        bindings::composer::test::iproducer::get_pong_res(forged).await
+    }
+
     fn run_add() -> i32 {
         bindings::add(20, 22)
     }

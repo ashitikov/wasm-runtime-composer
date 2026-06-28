@@ -101,7 +101,7 @@ impl ExportFunc {
 
 /// A composable unit — the composition-time API.
 ///
-/// Implemented by `ComposableInstance`, `ComposableComponent`, `Filtered`,
+/// Implemented by `ComposableInstance`, `ComposableComponent`, `FilteredExports`,
 /// and `Composition` (identity — for nesting a finalized composition).
 pub trait Composable: Send {
     /// Get the type signature (imports/exports) of this composable.
